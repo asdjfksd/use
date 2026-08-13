@@ -3104,9 +3104,24 @@ def handle_instagram_inputs(bot_instance, message):
             provider = parts[1].strip().lower()
             host = parts[2].strip().lower()
         else:
-            api_key = text
+            api_key = text.strip()
             provider = "instagram-best-experience"
             host = "instagram-best-experience.p.rapidapi.com"
+            
+        if api_key:
+            # Check if user sent a URL containing a token
+            if "token=" in api_key:
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = urlparse(api_key)
+                    queries = parse_qs(parsed.query)
+                    if "token" in queries:
+                        api_key = queries["token"][0]
+                except:
+                    parts_url = api_key.split("token=")
+                    if len(parts_url) > 1:
+                        api_key = parts_url[1].split("&")[0]
+            api_key = api_key.strip("'\" \t\r\n")
             
         if not api_key:
             bot_instance.reply_to(message, "❌ Invalid input. Setting API Key aborted.")
@@ -3134,7 +3149,23 @@ def handle_instagram_inputs(bot_instance, message):
 
     elif state == "WAITING_FOR_INSTAGRAM_APIFY_KEY":
         user_states[user_id] = None
-        api_key = text.strip()
+        raw_key = text.strip()
+        api_key = raw_key
+        
+        # Check if user sent a URL containing a token
+        if "token=" in raw_key:
+            try:
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(raw_key)
+                queries = parse_qs(parsed.query)
+                if "token" in queries:
+                    api_key = queries["token"][0]
+            except:
+                parts_url = raw_key.split("token=")
+                if len(parts_url) > 1:
+                    api_key = parts_url[1].split("&")[0]
+        api_key = api_key.strip("'\" \t\r\n")
+        
         provider = "apify"
         host = "apify.com"
         
