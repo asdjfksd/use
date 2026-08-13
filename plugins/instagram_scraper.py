@@ -447,6 +447,41 @@ def get_rapidapi_key():
     return get_setting("RAPIDAPI_KEY")
 
 
+def find_cursor_in_dict(d, depth=0):
+    if depth > 3:
+        return None
+    if not isinstance(d, dict):
+        return None
+        
+    preferred_keys = [
+        "next_max_id", "next_cursor", "end_cursor", "next_page_token", "cursor",
+        "nextPage", "next_page", "next", "after"
+    ]
+    for k in preferred_keys:
+        val = d.get(k)
+        if val and isinstance(val, (str, int)):
+            return str(val)
+            
+    nested_keys = ["page_info", "pagination", "paging", "cursors"]
+    for nk in nested_keys:
+        nd = d.get(nk)
+        if isinstance(nd, dict):
+            val = find_cursor_in_dict(nd, depth + 1)
+            if val:
+                return val
+                
+    for k, v in d.items():
+        k_lower = k.lower()
+        if any(x in k_lower for x in ["cursor", "max_id", "page_token", "next"]):
+            if isinstance(v, (str, int)) and v:
+                return str(v)
+            elif isinstance(v, dict):
+                val = find_cursor_in_dict(v, depth + 1)
+                if val:
+                    return val
+    return None
+
+
 # --- SCRAPER PROVIDER ADAPTERS ---
 class MockScraper:
     @staticmethod
@@ -992,31 +1027,25 @@ class RapidAPIScraper:
                                 })
                                 
             all_posts.extend(posts)
+            logger.info(f"RapidAPIScraper: parsed {len(posts)} posts in attempt {attempt}. Total posts accumulated: {len(all_posts)}")
             
-            # Parse next cursor dynamically
+            # Parse next cursor dynamically using robust find_cursor_in_dict
             next_c = None
             if isinstance(result, dict):
-                next_c = result.get("next_max_id") or result.get("next_cursor") or result.get("cursor") or result.get("next_page_token")
-                if not next_c and isinstance(result.get("page_info"), dict):
-                    page_info = result["page_info"]
-                    if page_info.get("has_next_page"):
-                        next_c = page_info.get("end_cursor")
-                if not next_c and isinstance(result.get("pagination"), dict):
-                    pagination = result["pagination"]
-                    next_c = pagination.get("next_max_id") or pagination.get("next_cursor") or pagination.get("cursor")
+                next_c = find_cursor_in_dict(result)
             if not next_c and isinstance(res_json, dict):
-                next_c = res_json.get("next_max_id") or res_json.get("next_cursor") or res_json.get("cursor") or res_json.get("next_page_token")
-                if not next_c and isinstance(res_json.get("page_info"), dict):
-                    page_info = res_json["page_info"]
-                    next_c = page_info.get("end_cursor") or page_info.get("next_max_id")
-                if not next_c and isinstance(res_json.get("pagination"), dict):
-                    pagination = res_json["pagination"]
-                    next_c = pagination.get("next_max_id") or pagination.get("next_cursor") or pagination.get("cursor")
+                next_c = find_cursor_in_dict(res_json)
                 
+            logger.info(f"RapidAPIScraper: extracted next cursor: '{next_c}'")
+            
             current_cursor = next_c
             
             # If no next cursor, or we have already collected at least 100 posts, stop fetching
-            if not current_cursor or len(all_posts) >= 100:
+            if not current_cursor:
+                logger.info("RapidAPIScraper: breaking loop because next cursor is None/empty.")
+                break
+            if len(all_posts) >= 100:
+                logger.info(f"RapidAPIScraper: breaking loop because accumulated posts count ({len(all_posts)}) is >= 100.")
                 break
                 
         unique_all_posts = []
