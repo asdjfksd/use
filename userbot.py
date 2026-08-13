@@ -230,7 +230,11 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN content_filter TEXT DEFAULT 'everything'")
             except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN content_filter TEXT DEFAULT 'everything'")
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN userbot_id BIGINT DEFAULT NULL")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN remove_caption_ids TEXT DEFAULT NULL")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN remove_fwd_ids TEXT DEFAULT NULL")
             except: pass
             # Update UNIQUE constraint for Postgres
             try:
@@ -432,6 +436,12 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN content_filter TEXT DEFAULT 'everything'")
             except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN userbot_id BIGINT DEFAULT NULL")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN remove_caption_ids TEXT DEFAULT NULL")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN remove_fwd_ids TEXT DEFAULT NULL")
+            except: pass
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS topic_mappings (
@@ -598,6 +608,43 @@ def init_db():
         cleanup_duplicate_pairs()
     except Exception as e:
         logger.error(f"Error calling cleanup_duplicate_pairs in init_db: {e}")
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM banned_users WHERE user_id < 0")
+            conn.commit()
+            logger.info("Database migration: cleared accidentally banned channels/groups from banned_users.")
+    except Exception as e:
+        logger.error(f"Error during init_db banned_users cleanup migration: {e}")
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            if USING_POSTGRES:
+                c.execute("ALTER TABLE target_pairs ADD COLUMN IF NOT EXISTS remove_caption INTEGER DEFAULT 0")
+            else:
+                try:
+                    c.execute("ALTER TABLE target_pairs ADD COLUMN remove_caption INTEGER DEFAULT 0")
+                except Exception:
+                    pass
+            conn.commit()
+            logger.info("Database migration: ensured remove_caption column exists in target_pairs.")
+    except Exception as e:
+        logger.error(f"Error during init_db remove_caption migration: {e}")
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, remove_caption FROM target_pairs WHERE remove_caption_ids IS NULL")
+            rows = c.fetchall()
+            for r_id, r_cap in rows:
+                val = "*" if r_cap == 1 else "0"
+                if USING_POSTGRES:
+                    c.execute("UPDATE target_pairs SET remove_caption_ids = %s WHERE id = %s", (val, r_id))
+                else:
+                    c.execute("UPDATE target_pairs SET remove_caption_ids = ? WHERE id = ?", (val, r_id))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error migrating remove_caption to remove_caption_ids: {e}")
+
     try:
         cleanup_old_processed_messages()
     except Exception as e:
@@ -767,7 +814,7 @@ async def check_and_promote_user(client, user_id, username, text_content, reply_
                 "You can now configure target pairs and instruct the userbot to join groups directly through this chat!\n\n"
                 "🛠️ **Available Commands:**\n"
                 "• `.join <link_or_username>`: Request the userbot to join a group or channel.\n"
-                "• `.pair <source> <target>` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
+                "• `.pair <source> <target> [content_type (A/M/T/F)] [caption (Y/N)]` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
                 "• `.delpair <pair_id>`: Delete a target pair.\n"
                 "• `.pairs` (or `.listpairs`): List all active target pairs.\n"
                 "• `.setpair <pair_id> <live/mon/mir> <1/0>`: Turn settings on (1) or off (0).\n\n"
@@ -848,6 +895,8 @@ async def notify_admin_flood_wait(client, action_name, seconds):
         logger.error(f"Error in notify_admin_flood_wait: {e}")
 
 def is_user_banned(user_id, username=None):
+    if user_id and user_id < 0:
+        return False
     try:
         with db_conn() as conn:
             c = conn.cursor()
@@ -863,6 +912,8 @@ def is_user_banned(user_id, username=None):
     return False
 
 def ban_user(user_id=None, username=None):
+    if user_id and user_id < 0:
+        return
     with db_conn() as conn:
         c = conn.cursor()
         uname = username.lower().replace("@", "") if username else None
@@ -1080,7 +1131,7 @@ def cleanup_duplicate_pairs():
     except Exception as e:
         logger.error(f"DB_CLEANUP: Error cleaning duplicate pairs: {e}")
 
-def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title):
+def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title, userbot_id=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
@@ -1110,13 +1161,13 @@ def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title
 
         if USING_POSTGRES:
             c.execute(
-                "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (sid, source_topic_id, tid, target_topic_id, s_title, t_title)
+                "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title, userbot_id) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                (sid, source_topic_id, tid, target_topic_id, s_title, t_title, userbot_id)
             )
         else:
             c.execute(
-                "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                (sid, source_topic_id, tid, target_topic_id, s_title, t_title)
+                "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title, userbot_id) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                (sid, source_topic_id, tid, target_topic_id, s_title, t_title, userbot_id)
             )
 
 async def instance_coordinator():
@@ -1382,6 +1433,153 @@ def get_target_pair(pair_id):
         p = get_placeholder()
         c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id, content_filter FROM target_pairs WHERE id = {p}", (pair_id,))
         return c.fetchone()
+
+def get_pair_remove_caption(pair_id):
+    try:
+        val = get_pair_remove_caption_ids(pair_id)
+        return 1 if val == "*" else (0 if val == "0" else 1)
+    except Exception:
+        return 0
+
+def get_pair_remove_caption_ids(pair_id):
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT remove_caption_ids FROM target_pairs WHERE id = {p}", (pair_id,))
+            row = c.fetchone()
+            return row[0] if (row and row[0] is not None) else "0"
+    except Exception:
+        return "0"
+
+def get_pair_remove_fwd_ids(pair_id):
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT remove_fwd_ids FROM target_pairs WHERE id = {p}", (pair_id,))
+            row = c.fetchone()
+            return row[0] if (row and row[0] is not None) else "0"
+    except Exception:
+        return "0"
+
+def should_strip_option(ids_setting, message):
+    if not ids_setting:
+        return False
+    clean_setting = str(ids_setting).strip().lower()
+    if clean_setting in ["0", "off", "false", "none", ""]:
+        return False
+    if clean_setting in ["*", "all", "1", "true"]:
+        return True
+        
+    check_ids = []
+    
+    sender_id = message.sender_id
+    if sender_id is None and message.chat_id:
+        sender_id = message.chat_id
+        
+    if sender_id:
+        check_ids.append(int(sender_id))
+        check_ids.append(str(sender_id))
+        str_sender = str(sender_id)
+        if str_sender.startswith("-100"):
+            check_ids.append(str_sender.replace("-100", "-"))
+            check_ids.append(str_sender.replace("-100", ""))
+        elif str_sender.startswith("-"):
+            check_ids.append("-100" + str_sender[1:])
+            check_ids.append(str_sender[1:])
+        else:
+            check_ids.append("-100" + str_sender)
+            check_ids.append("-" + str_sender)
+        
+    if getattr(message, 'fwd_from', None):
+        if message.fwd_from.from_id:
+            from telethon.utils import get_peer_id
+            try:
+                fwd_id = get_peer_id(message.fwd_from.from_id)
+                if fwd_id:
+                    check_ids.append(int(fwd_id))
+                    check_ids.append(str(fwd_id))
+                    str_fwd = str(fwd_id)
+                    if str_fwd.startswith("-100"):
+                        check_ids.append(str_fwd.replace("-100", "-"))
+                        check_ids.append(str_fwd.replace("-100", ""))
+                    elif str_fwd.startswith("-"):
+                        check_ids.append("-100" + str_fwd[1:])
+                        check_ids.append(str_fwd[1:])
+                    else:
+                        check_ids.append("-100" + str_fwd)
+                        check_ids.append("-" + str_fwd)
+            except Exception:
+                pass
+
+
+
+    config_ids = [x.strip() for x in clean_setting.split(",") if x.strip()]
+    for cid in config_ids:
+        if cid in check_ids:
+            return True
+        try:
+            val_int = int(cid)
+            if val_int in [int(x) for x in check_ids if isinstance(x, (int, float)) or (isinstance(x, str) and x.lstrip('-').isdigit())]:
+                return True
+        except ValueError:
+            pass
+            
+    return False
+
+def get_pair_userbot_id(pair_id):
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT userbot_id FROM target_pairs WHERE id = {p}", (pair_id,))
+            row = c.fetchone()
+            return row[0] if (row and row[0] is not None) else None
+    except Exception:
+        return None
+
+def pause_pair(pair_id):
+    try:
+        row = get_target_pair(pair_id)
+        if not row: return
+        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = row
+        
+        # Save original states
+        set_setting(f"paused_live_{pair_id}", is_live)
+        set_setting(f"paused_mon_{pair_id}", is_mon)
+        set_setting(f"is_paused_{pair_id}", 1)
+        
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET is_monitoring = 0, is_live = 0 WHERE id = {p}", (pair_id,))
+    except Exception as e:
+        logger.error(f"Error in pause_pair: {e}")
+
+def resume_pair(pair_id):
+    try:
+        if int(get_setting(f"is_paused_{pair_id}", 0)) == 0:
+            return
+            
+        # Restore original state
+        was_live = int(get_setting(f"paused_live_{pair_id}", 0))
+        was_mon = int(get_setting(f"paused_mon_{pair_id}", 0))
+        
+        # Clear settings
+        set_setting(f"paused_live_{pair_id}", 0)
+        set_setting(f"paused_mon_{pair_id}", 0)
+        set_setting(f"is_paused_{pair_id}", 0)
+        
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            if USING_POSTGRES:
+                c.execute(f"UPDATE target_pairs SET is_monitoring = %s, is_live = %s WHERE id = %s", (was_mon, was_live, pair_id))
+            else:
+                c.execute(f"UPDATE target_pairs SET is_monitoring = ?, is_live = ? WHERE id = ?", (was_mon, was_live, pair_id))
+    except Exception as e:
+        logger.error(f"Error in resume_pair: {e}")
 
 def get_pair_stats(pair_id):
     with db_conn() as conn:
@@ -1869,29 +2067,29 @@ def get_collection_markup(pair_id):
     btn_progress = InlineKeyboardButton(progress_bar, callback_data="progress_bar_click")
     markup.row(btn_progress)
     
-    btn_stop = InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}")
+    btn_stop = InlineKeyboardButton("🛑 Stop", callback_data=f"pair_stop_task_coll_{pair_id}")
     
     # Collect filter button
     col_map = {
-        "everything": "🔄 All Content",
-        "media": "🖼️ Media Only",
-        "text": "📝 Text Only",
-        "file": "📁 Files Only"
+        "everything": "All 🔄",
+        "media": "Media 🖼️",
+        "text": "Text 📝",
+        "file": "Files 📁"
     }
-    col_text = col_map.get(collect_filter, "🔄 All Content")
+    col_text = col_map.get(collect_filter, "All 🔄")
     btn_collect_filter = InlineKeyboardButton(f"Collect: {col_text}", callback_data=f"pair_coll_cfilter_{pair_id}")
     
     if instant_release:
-        btn_toggle = InlineKeyboardButton("📥 Hold Release", callback_data=f"pair_coll_toggle_{pair_id}_hold")
+        btn_toggle = InlineKeyboardButton("📥 Hold", callback_data=f"pair_coll_toggle_{pair_id}_hold")
         
-        cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
-        cf_text = cf_map.get(instant_filter, "🔄 All Content")
+        cf_map = {"everything": "All 🔄", "media": "Media 🖼️", "text": "Text 📝"}
+        cf_text = cf_map.get(instant_filter, "All 🔄")
         btn_filter = InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_coll_filter_{pair_id}")
         
         markup.row(btn_stop, btn_toggle)
         markup.row(btn_collect_filter, btn_filter)
     else:
-        btn_toggle = InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_coll_toggle_{pair_id}_instant")
+        btn_toggle = InlineKeyboardButton("⚡ Instant", callback_data=f"pair_coll_toggle_{pair_id}_instant")
         markup.row(btn_stop, btn_toggle)
         markup.row(btn_collect_filter)
     return markup
@@ -1903,14 +2101,14 @@ def get_release_markup(pid, source_type):
     key = f"{pid}_{source_type}"
     curr_filter = release_options.setdefault(key, "everything")
     
-    cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
-    cf_text = cf_map.get(curr_filter, "🔄 All Content")
+    cf_map = {"everything": "All 🔄", "media": "Media 🖼️", "text": "Text 📝"}
+    cf_text = cf_map.get(curr_filter, "All 🔄")
     
     markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(InlineKeyboardButton(f"Release Filter: {cf_text}", callback_data=f"pair_rel_filter_{source_type}_{pid}"))
+    markup.add(InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_rel_filter_{source_type}_{pid}"))
     markup.add(
-        InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_rel_now_{source_type}_{pid}"),
-        InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{source_type}_{pid}")
+        InlineKeyboardButton("⚡ Instant", callback_data=f"pair_rel_now_{source_type}_{pid}"),
+        InlineKeyboardButton("⏰ Slow", callback_data=f"pair_rel_slow_{source_type}_{pid}")
     )
     markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_release_{pid}"))
     return markup
@@ -1918,6 +2116,12 @@ def get_release_markup(pid, source_type):
 def stop_task(task_key):
     if task_key in running_tasks:
         running_tasks[task_key] = False
+        if task_key.startswith("coll_"):
+            try:
+                pid = int(task_key.replace("coll_", ""))
+                set_setting(f"collection_running_{pid}", 0)
+            except Exception:
+                pass
         return True
     return False
 
@@ -2099,11 +2303,10 @@ def pairs_list_markup():
         
         btn_text = f"📁 {topic_status}{s_title} ➔ {t_title} {mon_status}{live_status} ({stats['pending']})"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
-    
+        
     markup.add(InlineKeyboardButton("➕ Add New Pair", callback_data="pair_add_start"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
-
 async def show_pair_view(chat_id, message_id, pid):
     try:
         row = get_target_pair(pid)
@@ -2112,10 +2315,26 @@ async def show_pair_view(chat_id, message_id, pid):
             return
             
         pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, c_filter = row
+        remove_caption_ids = get_pair_remove_caption_ids(pid)
+        remove_fwd_ids = get_pair_remove_fwd_ids(pid)
         stats = get_pair_stats(pid)
         mon_status = "🟢 Running" if is_mon else "🔴 Stopped"
         live_status = "🟢 Running" if is_live else "🔴 Stopped"
         mir_status = "🟢 Enabled" if is_mir else "🔴 Disabled"
+        
+        if remove_caption_ids == "*":
+            remove_caption_status = "🟢 Enabled (All)"
+        elif remove_caption_ids in ["0", "", None]:
+            remove_caption_status = "🔴 Disabled"
+        else:
+            remove_caption_status = f"⚙️ Custom ({remove_caption_ids})"
+            
+        if remove_fwd_ids == "*":
+            remove_fwd_status = "🟢 Enabled (All)"
+        elif remove_fwd_ids in ["0", "", None]:
+            remove_fwd_status = "🔴 Disabled"
+        else:
+            remove_fwd_status = f"⚙️ Custom ({remove_fwd_ids})"
         
         src_text = f"`{s_title}`" + (f" • Topic: `{s_topic}`" if s_topic else "")
         tgt_text = f"`{t_title}`" + (f" • Topic: `{t_topic}`" if t_topic else "")
@@ -2129,7 +2348,9 @@ async def show_pair_view(chat_id, message_id, pid):
             f"🤖 *Automation Status:*\n"
             f"Monitor: `{mon_status}`\n"
             f"Live: `{live_status}`\n"
-            f"Mirror: `{mir_status}`"
+            f"Mirror: `{mir_status}`\n"
+            f"Remove Caption: `{remove_caption_status}`\n"
+            f"Remove Fwd Tag: `{remove_fwd_status}`"
         )
         
         # Resolve target chats asynchronously to check if both are topics/forums
@@ -2142,16 +2363,68 @@ async def show_pair_view(chat_id, message_id, pid):
             except Exception as e:
                 logger.error(f"Forum check failed: {e}")
                 
-        try:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid, both_forums), parse_mode="Markdown")
-        except Exception as e:
-            if "message is not modified" in str(e):
-                pass
-            else:
-                raise e
+        if message_id:
+            try:
+                bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid, both_forums), parse_mode="Markdown")
+            except Exception as e:
+                if "message is not modified" in str(e):
+                    pass
+                else:
+                    raise e
+        else:
+            bot.send_message(chat_id, text, reply_markup=pair_view_markup(pid, both_forums), parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Pair View Error: {e}")
         bot.send_message(chat_id, f"❌ Error opening pair management: {e}")
+
+async def show_set_ids_menu(chat_id, message_id, pair_id):
+    cap_ids = get_pair_remove_caption_ids(pair_id)
+    fwd_ids = get_pair_remove_fwd_ids(pair_id)
+    
+    if cap_ids == "*":
+        cap_status = "Strip All ❌"
+    elif cap_ids in ["0", "", None]:
+        cap_status = "Keep Captions 📝"
+    else:
+        cap_status = "Strip Custom ⚙️"
+        
+    if fwd_ids == "*":
+        fwd_status = "Strip All ❌"
+    elif fwd_ids in ["0", "", None]:
+        fwd_status = "Keep Fwd Tag 🏷️"
+    else:
+        fwd_status = "Strip Custom ⚙️"
+
+    text = (
+        "⚙️ **Strip Settings**\n\n"
+        "Configure how captions and forward tags should be processed for this pair:\n\n"
+        f"📝 **Caption Strip:** `{cap_status}`" + (f" (IDs: `{cap_ids}`)" if cap_ids not in ["*", "0"] else "") + "\n"
+        f"🏷️ **Fwd Tag Strip:** `{fwd_status}`" + (f" (IDs: `{fwd_ids}`)" if fwd_ids not in ["*", "0"] else "")
+    )
+    
+    markup = InlineKeyboardMarkup()
+    
+    # Toggle buttons
+    btn_cap_toggle = InlineKeyboardButton(f"Toggle Caption: {cap_status}", callback_data=f"pair_toggle_caption_sub_{pair_id}")
+    btn_fwd_toggle = InlineKeyboardButton(f"Toggle Fwd Tag: {fwd_status}", callback_data=f"pair_toggle_fwd_sub_{pair_id}")
+    markup.row(btn_cap_toggle)
+    markup.row(btn_fwd_toggle)
+    
+    # Edit buttons
+    markup.add(
+        InlineKeyboardButton("📝 Edit Caption IDs", callback_data=f"pair_edit_cap_ids_{pair_id}"),
+        InlineKeyboardButton("🏷️ Edit Fwd Tag IDs", callback_data=f"pair_edit_fwd_ids_{pair_id}")
+    )
+    
+    markup.add(InlineKeyboardButton("🔙 Back to Pair", callback_data=f"pair_view_{pair_id}"))
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+        except Exception as e:
+            if "message is not modified" not in str(e):
+                raise e
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
 
 def pair_view_markup(pair_id, show_mirror=False):
     pair = get_target_pair(pair_id)
@@ -2169,13 +2442,15 @@ def pair_view_markup(pair_id, show_mirror=False):
         InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
     
-    # Unconditionally show Mirror Mode button so the admin can always toggle it!
-    markup.add(InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"))
+    markup.add(
+        InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"),
+        InlineKeyboardButton("⚙️ Strip Settings", callback_data=f"pair_set_ids_menu_{pair_id}")
+    )
     
     # Content Filter Button
     cf = pair[10] or "everything"
-    cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only", "file": "📁 Files Only"}
-    cf_text = cf_map.get(cf, "🔄 All Content")
+    cf_map = {"everything": "All 🔄", "media": "Media 🖼️", "text": "Text 📝", "file": "Files 📁"}
+    cf_text = cf_map.get(cf, "All 🔄")
     markup.add(InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_toggle_filter_{pair_id}"))
     
     # Retrieve unreleased source counts
@@ -2421,13 +2696,27 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
         ))
         
-        await asyncio.sleep(1)
-        res_after = await client(functions.messages.GetForumTopicsRequest(
-            peer=target_chat,
-            offset_date=0, offset_id=0, offset_topic=0, limit=20
-        ))
-        for t in res_after.topics:
-            topic_cache[t_chat_id][t.title.lower().strip()] = t.id
+        # Try to extract topic ID from the created response
+        topic_id = None
+        if created and hasattr(created, 'updates'):
+            for update in created.updates:
+                if hasattr(update, 'message') and hasattr(update.message, 'action'):
+                    if isinstance(update.message.action, types.MessageActionTopicCreate):
+                        topic_id = update.message.id
+                        break
+        
+        if topic_id:
+            logger.info(f"MIRROR: Successfully extracted created topic ID: {topic_id}")
+            topic_cache[t_chat_id][title_key] = topic_id
+        else:
+            logger.warning("MIRROR: Could not extract topic ID from CreateForumTopicRequest updates. Falling back to GetForumTopicsRequest scan.")
+            await asyncio.sleep(1)
+            res_after = await client(functions.messages.GetForumTopicsRequest(
+                peer=target_chat,
+                offset_date=0, offset_id=0, offset_topic=0, limit=100
+            ))
+            for t in res_after.topics:
+                topic_cache[t_chat_id][t.title.lower().strip()] = t.id
             
         final_id = topic_cache[t_chat_id].get(title_key)
         if final_id and source_chat_id and source_topic_id:
@@ -2524,15 +2813,15 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
                     src_icon = getattr(forum, "icon_emoji_id", None)
                     if not src_title:
                         try:
-                            res = await client(functions.messages.GetForumTopicsRequest(
-                                peer=source_chat, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                            res = await client(functions.messages.GetForumTopicsByIDRequest(
+                                peer=source_chat,
+                                topics=[int(s_top)]
                             ))
-                            for t in res.topics:
-                                if t.id == s_top:
-                                    src_title = t.title
-                                    src_icon = getattr(t, "icon_emoji_id", None)
-                                    break
-                        except Exception: pass
+                            if res and res.topics:
+                                src_title = res.topics[0].title
+                                src_icon = getattr(res.topics[0], "icon_emoji_id", None)
+                        except Exception as e:
+                            logger.error(f"Failed to fetch source topic title by ID {s_top} in vault_media: {e}")
                     if src_title:
                         dest_topic_id = await get_or_create_target_topic(
                             client, log_chat_id, src_title, source_chat_id, s_top, icon_emoji_id=src_icon
@@ -2589,7 +2878,6 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
                     source_msg_id=int(orig_m.id),
                     file_id=None,
                     media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                    caption=orig_m.message or "",
                     grouped_id=orig_m.grouped_id
                 )
     except Exception as e:
@@ -2623,8 +2911,21 @@ def update_telethon_entity_cache(client, peer):
     except Exception as e:
         logger.error(f"Failed to update client._mb_entity_cache: {e}")
 
-async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, pre_downloaded=None):
+async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, pre_downloaded=None, pair_id=None):
     """Unified Hub for mirrored sending with native Forum Topic support and Client Failover."""
+    def safe_int(val):
+        if not val:
+            return None
+        val_str = str(val).strip()
+        if val_str.lower() in ["none", "null", "0", ""]:
+            return None
+        try:
+            return int(val_str)
+        except ValueError:
+            return None
+
+    remove_caption_ids = get_pair_remove_caption_ids(pair_id) if pair_id else "0"
+    remove_fwd_ids = get_pair_remove_fwd_ids(pair_id) if pair_id else "0"
     downloaded_files = []
     try:
         if not messages: return
@@ -2658,18 +2959,8 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             client_name = getattr(active_client._me, 'first_name', 'Unknown')
             logger.info(f"🔄 Mirror attempt using client: {client_name} (@{getattr(active_client._me, 'username', 'unknown')})")
             
-            # Ensure the client is joined to source and target groups
-            try:
-                await ensure_joined(active_client, sid)
-            except Exception as ej_err:
-                logger.error(f"Failed to ensure client is joined to source {sid}: {ej_err}")
-            try:
-                await ensure_joined(active_client, tid)
-            except Exception as ej_err:
-                logger.error(f"Failed to ensure client is joined to target {tid}: {ej_err}")
-            
-            # Download media if not already done and we need to upload
-            if has_media and not downloaded_paths:
+            # Download media if not already done (primary client can use server IDs directly to avoid download)
+            if has_media and not downloaded_paths and active_client != client:
                 for m in messages:
                     if m.media:
                         try:
@@ -2681,7 +2972,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         except Exception as de:
                             logger.error(f"Mirror download failed for client {client_name}: {de}")
             
-            dest_topic_id = default_t_topic
+            dest_topic_id = safe_int(default_t_topic)
             try:
                 # 0. Resolve Target Chat Entity
                 try:
@@ -2704,31 +2995,41 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         if not src_title:
                             try:
                                 resolved_sid = await resolve_target_id(active_client, sid)
-                                res = await active_client(functions.messages.GetForumTopicsRequest(
-                                    peer=resolved_sid,
-                                    offset_date=0,
-                                    offset_id=0,
-                                    offset_topic=0,
-                                    limit=100
-                                ))
-                                for t in res.topics:
-                                    if t.id == source_top:
-                                        src_title = t.title
-                                        src_icon = getattr(t, "icon_emoji_id", None)
-                                        break
+                                try:
+                                    res = await active_client(functions.channels.GetForumTopicsByIDRequest(
+                                        channel=resolved_sid,
+                                        topics=[int(source_top)]
+                                    ))
+                                    if res and res.topics:
+                                        src_title = res.topics[0].title
+                                        src_icon = getattr(res.topics[0], "icon_emoji_id", None)
+                                except Exception:
+                                    res = await active_client(functions.messages.GetForumTopicsRequest(
+                                        peer=resolved_sid,
+                                        offset_date=0,
+                                        offset_id=0,
+                                        offset_topic=0,
+                                        limit=100
+                                    ))
+                                    for t in res.topics:
+                                        if t.id == source_top:
+                                            src_title = t.title
+                                            src_icon = getattr(t, "icon_emoji_id", None)
+                                            break
                             except Exception: pass
                         
                         if src_title:
                             logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
                             dest_topic_id = await get_or_create_target_topic(active_client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
+                            dest_topic_id = safe_int(dest_topic_id)
 
                 # 2. Check if Target is a Forum
-                is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+                is_forum = (getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False) or (dest_topic_id is not None)
 
                 # 3. Resolve Reply Header
                 reply_header = None
                 if is_forum:
-                    reply_header = int(dest_topic_id) if dest_topic_id else None
+                    reply_header = safe_int(dest_topic_id)
                     top_msg_id = None
                     if first_msg.reply_to:
                         top_msg_id = getattr(first_msg.reply_to, 'reply_to_top_id', None)
@@ -2737,18 +3038,20 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                     if top_msg_id:
                         mapped_top = get_message_mapping(sid, top_msg_id, tid)
                         if mapped_top:
-                            reply_header = int(mapped_top)
+                            reply_header = safe_int(mapped_top)
                     if first_msg.reply_to_msg_id and (not top_msg_id or first_msg.reply_to_msg_id != top_msg_id):
                         mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
                         if mapped:
-                            reply_header = int(mapped)
+                            reply_header = safe_int(mapped)
                 else:
                     if first_msg.reply_to_msg_id:
                         mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
                         if mapped:
-                            reply_header = int(mapped)
+                            reply_header = safe_int(mapped)
 
                 # 4. Construct Album Text and Files List
+                strip_caption = should_strip_option(remove_caption_ids, first_msg)
+                strip_fwd = should_strip_option(remove_fwd_ids, first_msg)
                 album_text = next((msg.message for msg in messages if msg.message), "")
                 files_to_send = []
                 for msg in messages:
@@ -2761,6 +3064,9 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                 
                 file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
                 
+                if strip_caption and file_to_send:
+                    album_text = ""
+                
                 if not album_text.strip() and not file_to_send:
                     logger.warning(f"⚠️ MIRROR: Skipping message {first_msg.id} because it has no text content and no media/file.")
                     return
@@ -2768,7 +3074,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                 for attempt in range(3):
                     try:
                         # Attempt native forward first if not restricted/pre-downloaded to preserve the forward tag
-                        if not pre_downloaded and not downloaded_files:
+                        if not strip_caption and not strip_fwd and not pre_downloaded and not downloaded_files:
                             try:
                                 import random
                                 random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
@@ -2887,8 +3193,8 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         if not sent:
                             if reply_header is not None:
                                 next_reply_header = None
-                                if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
-                                    next_reply_header = int(dest_topic_id)
+                                if is_forum and dest_topic_id and reply_header != safe_int(dest_topic_id):
+                                    next_reply_header = safe_int(dest_topic_id)
                                 logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
                                 try:
                                     sent = await active_client.send_message(
@@ -3114,17 +3420,6 @@ async def media_queue_worker():
                 for active_client in clients_pool:
                     client_name = getattr(active_client._me, 'first_name', 'Unknown')
                     logger.info(f"⏰ Queue Worker: Attempting send using client {client_name}...")
-                    
-                    # Ensure the client is joined to source and target groups
-                    try:
-                        await ensure_joined(active_client, sid)
-                    except Exception as ej_err:
-                        logger.error(f"Failed to ensure Queue client joined to source {sid}: {ej_err}")
-                    try:
-                        await ensure_joined(active_client, target_chat_id)
-                    except Exception as ej_err:
-                        logger.error(f"Failed to ensure Queue client joined to target {target_chat_id}: {ej_err}")
-                        
                     try:
                         target_entity = await resolve_target_id(active_client, target_chat_id)
                     except Exception as te:
@@ -3347,6 +3642,15 @@ async def process_automation_pipeline(client, messages, source_chat_id):
         msg_chat_str = str(source_chat_id).replace("-100", "")
         
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
+            assigned_ub_id = get_pair_userbot_id(pid)
+            if assigned_ub_id is not None:
+                if not hasattr(client, '_me') or not client._me:
+                    try: client._me = await client.get_me()
+                    except Exception: pass
+                me_id = getattr(client._me, 'id', None) if getattr(client, '_me', None) else None
+                if me_id and me_id != assigned_ub_id:
+                    continue
+
             source_id_str = str(sid).replace("-100", "")
             if source_id_str != msg_chat_str:
                 continue
@@ -3413,7 +3717,8 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                             t_topic, 
                             is_mir, 
                             sid, 
-                            pre_downloaded=media_to_file if (is_protected_flow and has_media) else None
+                            pre_downloaded=media_to_file if (is_protected_flow and has_media) else None,
+                            pair_id=pid
                         )
                     except Exception as sme:
                         logger.error(f"Live mirror/forward failed: {sme}. Queueing...")
@@ -3845,9 +4150,9 @@ def setup_automation_handlers(client: TelegramClient):
         # It bypasses all group/channel auto-forwarding, links, commands, and promotion systems.
         if is_client_manager:
             if event.is_private and m.sender_id != me.id and m.media:
-                async def run_manager_private_save_group(msgs):
+                async def run_manager_private_save():
                     try:
-                        first_msg = msgs[0]
+                        # Extract sender info
                         sender = await event.get_sender()
                         sender_name = getattr(sender, 'first_name', '') or ''
                         if getattr(sender, 'last_name', None):
@@ -3858,82 +4163,45 @@ def setup_automation_handlers(client: TelegramClient):
                         username_str = f" (@{username})" if username else ""
                         
                         header = f"💬 **Monitored PM Message**\n"
-                        header += f"👤 **Sender:** [{sender_name}](tg://user?id={first_msg.sender_id}) (`{first_msg.sender_id}`){username_str}\n\n"
-                        
-                        temp_paths = []
-                        downloaded_files = []
-                        
-                        for msg in msgs:
-                            if msg.media:
-                                try:
-                                    path = await client.download_media(msg)
-                                    if path:
-                                        temp_paths.append(path)
-                                        downloaded_files.append(path)
-                                    else:
-                                        temp_paths.append(msg.media)
-                                except Exception as de:
-                                    logger.error(f"Manager private download failed: {de}")
-                                    temp_paths.append(msg.media)
-                                    
-                        album_text = next((msg.message for msg in msgs if msg.message), "")
-                        caption_text = header + album_text
+                        header += f"👤 **Sender:** [{sender_name}](tg://user?id={m.sender_id}) (`{m.sender_id}`){username_str}\n\n"
                         
                         try:
-                            if temp_paths:
+                            temp_path = await client.download_media(m)
+                            if temp_path:
+                                # Add self-destructing visual tag if applicable
+                                ttl = getattr(m, 'ttl_seconds', None) or (getattr(m.media, 'ttl_seconds', None) if m.media else None)
+                                tag = "🔥 **Self-Destructing Media Save**\n\n" if (ttl and ttl > 0) else ""
+                                
                                 await client.send_message(
                                     entity="me",
-                                    file=temp_paths,
-                                    message=caption_text
+                                    file=temp_path,
+                                    message=header + tag + (m.message or "")
                                 )
-                            elif album_text:
-                                await client.send_message(entity="me", message=caption_text)
-                        except Exception as se:
-                            logger.error(f"Manager userbot failed to send private media group: {se}")
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                            else:
+                                # Fallback to native forward
+                                await client.send_message(entity="me", message=header)
+                                await client.forward_messages(
+                                    entity="me",
+                                    messages=m,
+                                    from_peer=event.chat_id
+                                )
+                        except Exception as e:
+                            logger.error(f"Manager userbot failed to download/send private media: {e}")
                             try:
                                 await client.send_message(entity="me", message=header)
                                 await client.forward_messages(
                                     entity="me",
-                                    messages=msgs,
+                                    messages=m,
                                     from_peer=event.chat_id
                                 )
-                            except Exception as fe:
-                                logger.error(f"Manager userbot fallback group forward failed: {fe}")
-                                
-                        for f_path in downloaded_files:
-                            if f_path and os.path.exists(f_path):
-                                try:
-                                    os.remove(f_path)
-                                except Exception:
-                                    pass
+                            except Exception as e2:
+                                logger.error(f"Manager userbot fallback forward failed: {e2}")
                     except Exception as e:
-                        logger.error(f"Error in manager private group save: {e}")
-
-                async def save_manager_pm_album(gid, sender_id):
-                    await asyncio.sleep(2.5)
-                    messages = manager_album_cache.pop(gid, [])
-                    if not messages: return
-                    
-                    lock_key = f"{sender_id}_{gid}"
-                    if lock_key in manager_album_processing_lock:
-                        return
-                    manager_album_processing_lock.add(lock_key)
-                    
-                    try:
-                        messages.sort(key=lambda x: x.id)
-                        await run_manager_private_save_group(messages)
-                    finally:
-                        manager_album_processing_lock.discard(lock_key)
-
-                if m.grouped_id:
-                    if m.grouped_id not in manager_album_cache:
-                        manager_album_cache[m.grouped_id] = [m]
-                        asyncio.create_task(save_manager_pm_album(m.grouped_id, m.sender_id))
-                    else:
-                        if m.id not in [msg.id for msg in manager_album_cache[m.grouped_id]]:
-                            manager_album_cache[m.grouped_id].append(m)
-                else:
-                    asyncio.create_task(run_manager_private_save_group([m]))
+                        logger.error(f"Error in manager private save: {e}")
+                        
+                asyncio.create_task(run_manager_private_save())
             return
 
         # FAST DROP: Immediately ignore messages if the source chat isn't in configured pairs
@@ -4228,15 +4496,49 @@ def setup_automation_handlers(client: TelegramClient):
                 parts = text.split()
                 cmd = parts[0].lower()
                 
-                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair', '.addmanager', '.delmanager', '.managers', '.join', '.setpromo', '.promo']:
+                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair', '.addmanager', '.delmanager', '.managers', '.join', '.setpromo', '.promo', '.tasks', '.task']:
                     try:
-                        if cmd in ['.addpair', '.pair']:
+                        if cmd in ['.tasks', '.task']:
+                            report = get_active_tasks_report()
+                            await event.reply(report)
+                            return
+                            
+                        elif cmd in ['.addpair', '.pair']:
                             if len(parts) < 3:
-                                await event.reply("❌ **Usage:** `.addpair <source> <target>`\n(Source/Target can be usernames, links, topic links, or numeric IDs)")
+                                await event.reply("❌ **Usage:** `.pair <source> <target> [content_type (A/M/T/F)] [caption (Y/N)]`\n(Source/Target can be usernames, links, topic links, or numeric IDs)")
                                 return
                             
                             source_raw = parts[1]
                             target_raw = parts[2]
+                            
+                            # Parse content_type
+                            content_filter_val = "everything"
+                            if len(parts) >= 4:
+                                ct_arg = parts[3].upper()
+                                if ct_arg == 'M':
+                                    content_filter_val = "media"
+                                elif ct_arg == 'T':
+                                    content_filter_val = "text"
+                                elif ct_arg == 'F':
+                                    content_filter_val = "file"
+                                elif ct_arg == 'A':
+                                    content_filter_val = "everything"
+                                else:
+                                    await event.reply("❌ **Invalid content type!** Use:\n• `A` for All Content (default)\n• `M` for Media Only\n• `T` for Text Only\n• `F` for Files Only")
+                                    return
+
+                            # Parse caption option (Y: keep, N: remove)
+                            remove_caption_val = 0
+                            if len(parts) >= 5:
+                                cap_arg = parts[4].upper()
+                                if cap_arg == 'Y':
+                                    remove_caption_val = 0
+                                elif cap_arg == 'N':
+                                    remove_caption_val = 1
+                                else:
+                                    await event.reply("❌ **Invalid caption option!** Use:\n• `Y` to Keep Captions (default)\n• `N` to Strip/Remove Captions")
+                                    return
+
                             await event.reply("⏳ **Resolving source and target entities...**")
                             
                             s_entity, s_topic = await resolve_chat_and_topic(client, source_raw)
@@ -4249,17 +4551,20 @@ def setup_automation_handlers(client: TelegramClient):
                             sid = get_peer_id(s_entity)
                             tid = get_peer_id(t_entity)
                             
-                            extract_and_save_group_link(s_entity, source_raw)
-                            extract_and_save_group_link(t_entity, target_raw)
+                            if not hasattr(client, '_me') or not client._me:
+                                try: client._me = await client.get_me()
+                                except Exception: pass
+                            me_id = getattr(client._me, 'id', None) if getattr(client, '_me', None) else None
+
+                            add_target_pair(sid, s_topic, tid, t_topic, s_title, t_title, userbot_id=me_id)
                             
-                            add_target_pair(sid, s_topic, tid, t_topic, s_title, t_title)
-                            
-                            # Update target pair to set is_live = 1 and is_mirror = 1 by default
+                            # Update target pair to set is_live = 1, is_mirror = 1, and custom filter/caption/userbot_id options
                             with db_conn() as conn:
                                 c = conn.cursor()
                                 p = get_placeholder()
-                                query = f"UPDATE target_pairs SET is_live = 1, is_mirror = 1 WHERE source_id = {p} AND target_id = {p}"
-                                params = [sid, tid]
+                                remove_caption_ids_val = "*" if remove_caption_val == 1 else "0"
+                                query = f"UPDATE target_pairs SET is_live = 1, is_mirror = 1, content_filter = {p}, remove_caption = {p}, remove_caption_ids = {p}, userbot_id = {p} WHERE source_id = {p} AND target_id = {p}"
+                                params = [content_filter_val, remove_caption_val, remove_caption_ids_val, me_id, sid, tid]
                                 if s_topic is not None:
                                     query += f" AND source_topic_id = {p}"
                                     params.append(s_topic)
@@ -4300,6 +4605,8 @@ def setup_automation_handlers(client: TelegramClient):
                                 f"**ID:** `{pair_id}`\n"
                                 f"**Source:** `{s_title}`" + (f" (Topic: `{s_topic}`)" if s_topic else "") + f" (ID: `{sid}`)\n"
                                 f"**Target:** `{t_title}`" + (f" (Topic: `{t_topic}`)" if t_topic else "") + f" (ID: `{tid}`)\n\n"
+                                f"🎯 **Filter:** `{content_filter_val.title()}`\n"
+                                f"📝 **Caption:** `{'Removed' if remove_caption_val else 'Kept'}`\n\n"
                                 f"⚡ *Live forwarding and mirroring enabled by default.*"
                             )
                             return
@@ -4491,7 +4798,7 @@ def setup_automation_handlers(client: TelegramClient):
                                     "You can now configure target pairs and instruct the userbot to join groups directly through this chat!\n\n"
                                     "🛠️ **Available Commands:**\n"
                                     "• `.join <link_or_username>`: Request the userbot to join a group or channel.\n"
-                                    "• `.pair <source> <target>` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
+                                    "• `.pair <source> <target> [content_type (A/M/T/F)] [caption (Y/N)]` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
                                     "• `.delpair <pair_id>`: Delete a target pair.\n"
                                     "• `.pairs` (or `.listpairs`): List all active target pairs.\n"
                                     "• `.setpair <pair_id> <live/mon/mir> <1/0>`: Turn settings on (1) or off (0).\n\n"
@@ -4597,17 +4904,15 @@ def setup_automation_handlers(client: TelegramClient):
                                     cid = get_peer_id(chat_entity)
                                     title = getattr(chat_entity, 'title', None) or getattr(chat_entity, 'first_name', None) or str(cid)
                                     
-                                    extract_and_save_group_link(chat_entity, target_link)
-                                    
                                     await event.reply(
                                         f"✅ **Joined Group Successfully!**\n"
                                         f"**Name:** `{title}`\n"
                                         f"**ID:** `{cid}`\n\n"
                                         f"💡 **Quick Setup Templates:**\n"
                                         f"• Set as **Source** (forward FROM this group):\n"
-                                        f"  `.pair {cid} <target_id>`\n"
+                                        f"  `.pair {cid} <target_id> [content_type (A/M/T/F)] [caption (Y/N)]`\n"
                                         f"• Set as **Target** (forward TO this group):\n"
-                                        f"  `.pair <source_id> {cid}`"
+                                        f"  `.pair <source_id> {cid} [content_type (A/M/T/F)] [caption (Y/N)]`"
                                     )
                                 else:
                                     await event.reply("❌ Failed to retrieve chat information.")
@@ -5089,17 +5394,17 @@ def cmd_add_manager(message):
             
             # Send welcome DM to the new manager from the userbot!
             welcome_msg = (
-                "🎉 **Congratulations! You have been authorized as a Manager!**\n\n"
-                "You can now configure target pairs and instruct the userbot to join groups directly through this chat!\n\n"
-                "🛠️ **Available Commands:**\n"
-                "• `.join <link_or_username>`: Request the userbot to join a group or channel.\n"
-                "• `.pair <source> <target>` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
-                "• `.delpair <pair_id>`: Delete a target pair.\n"
-                "• `.pairs` (or `.listpairs`): List all active target pairs.\n"
-                "• `.setpair <pair_id> <live/mon/mir> <1/0>`: Turn settings on (1) or off (0).\n\n"
-                "💬 **Group Joining Wizard:**\n"
-                "Simply send any Telegram group link or username (e.g. `t.me/cctest` or `@cctest`) to this chat, and I will automatically guide you on how to join and configure it!"
-            )
+                                "🎉 **Congratulations! You have been authorized as a Manager!**\n\n"
+                                "You can now configure target pairs and instruct the userbot to join groups directly through this chat!\n\n"
+                                "🛠️ **Available Commands:**\n"
+                                "• `.join <link_or_username>`: Request the userbot to join a group or channel.\n"
+                                "• `.pair <source> <target> [content_type (A/M/T/F)] [caption (Y/N)]` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
+                                "• `.delpair <pair_id>`: Delete a target pair.\n"
+                                "• `.pairs` (or `.listpairs`): List all active target pairs.\n"
+                                "• `.setpair <pair_id> <live/mon/mir> <1/0>`: Turn settings on (1) or off (0).\n\n"
+                                "💬 **Group Joining Wizard:**\n"
+                                "Simply send any Telegram group link or username (e.g. `t.me/cctest` or `@cctest`) to this chat, and I will automatically guide you on how to join and configure it!"
+                            )
             try:
                 await userbot.send_message(user_entity, welcome_msg)
             except Exception as welcome_err:
@@ -5333,10 +5638,6 @@ async def join_chat_task(call, link_type, value):
         peer_id = get_peer_id(chat_entity)
         chat_title = getattr(chat_entity, "title", "Joined Chat")
         
-        # Save group link
-        link_val = f"https://t.me/+{value}" if link_type == "invite" else f"https://t.me/{value}"
-        save_group_link(peer_id, chat_title, link_val)
-        
         login_data[call.from_user.id] = {
             "joined_chat_id": peer_id,
             "joined_chat_title": chat_title
@@ -5372,13 +5673,16 @@ async def finalize_pair_task(call, uid):
 
         bot.edit_message_text("⏳ Resolving pair details...", call.message.chat.id, call.message.message_id)
         
-        s_chat = await resolve_target_id(userbot, sid)
-        t_chat = await resolve_target_id(userbot, tid)
+        client_id = data.get("userbot_id")
+        client = userbot_fleet_manager.get_client(client_id) if client_id else userbot
+        
+        s_chat = await resolve_target_id(client, sid)
+        t_chat = await resolve_target_id(client, tid)
         
         s_title = getattr(s_chat, 'title', None) or getattr(s_chat, 'first_name', None) or str(sid)
         t_title = getattr(t_chat, 'title', None) or getattr(t_chat, 'first_name', None) or str(tid)
         
-        add_target_pair(sid, stid, tid, ttid, s_title, t_title)
+        add_target_pair(sid, stid, tid, ttid, s_title, t_title, userbot_id=client_id)
         
         success_text = f"✅ *Pair Added!*\n\n"
         success_text += f"Source: `{s_title}`" + (f" (Topic: `{stid}`)" if stid else "") + "\n"
@@ -5404,68 +5708,6 @@ def handle_callbacks(call):
     
     if data == "progress_bar_click":
         bot.answer_callback_query(call.id)
-        return
-        
-    if data.startswith("pair_userbots_list|"):
-        bot.answer_callback_query(call.id)
-        parts = data.split("|")
-        prefix = parts[1]
-        
-        markup = InlineKeyboardMarkup(row_width=1)
-        clients = userbot_fleet_manager.get_all_clients()
-        connected_clients = [c for c in clients if c.is_connected()]
-        
-        for client in connected_clients:
-            me = getattr(client, '_me', None)
-            if me:
-                first_name = me.first_name or "Unknown"
-                username = me.username or "No Username"
-                markup.add(InlineKeyboardButton(
-                    f"👤 {first_name} (@{username})",
-                    callback_data=f"pair_select_userbot|{prefix}|{me.id}"
-                ))
-                
-        markup.add(InlineKeyboardButton("🔙 Back to Chats", callback_data=f"pair_userbots_back|{prefix}"))
-        bot.edit_message_text(
-            "👤 *Select Userbot*\n\nChoose the userbot whose groups/channels you want to view:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode="Markdown"
-        )
-        return
-
-    elif data.startswith("pair_select_userbot|"):
-        parts = data.split("|")
-        prefix = parts[1]
-        userbot_id = int(parts[2])
-        
-        if uid not in login_data:
-            login_data[uid] = {}
-        login_data[uid]["pairing_userbot_id"] = userbot_id
-        
-        bot.answer_callback_query(call.id, "Userbot selected.")
-        
-        async def redirect_back():
-            client = userbot_fleet_manager.get_client(userbot_id)
-            markup = await get_chat_selection_markup(prefix, 0, client=client)
-            text = "🎯 *Select Source Chat*\nChoose the group or channel to collect from:" if prefix == "sel_src" else "🎯 *Select Target Chat*\nChoose the group or channel to send to:"
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        asyncio.run_coroutine_threadsafe(redirect_back(), loop)
-        return
-
-    elif data.startswith("pair_userbots_back|"):
-        bot.answer_callback_query(call.id)
-        parts = data.split("|")
-        prefix = parts[1]
-        userbot_id = login_data.get(uid, {}).get("pairing_userbot_id")
-        client = userbot_fleet_manager.get_client(userbot_id) if userbot_id else None
-        
-        async def redirect_back():
-            markup = await get_chat_selection_markup(prefix, 0, client=client)
-            text = "🎯 *Select Source Chat*\nChoose the group or channel to collect from:" if prefix == "sel_src" else "🎯 *Select Target Chat*\nChoose the group or channel to send to:"
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        asyncio.run_coroutine_threadsafe(redirect_back(), loop)
         return
         
     if data.startswith("join_chat_yes|"):
@@ -5898,6 +6140,87 @@ def handle_callbacks(call):
             logger.error(f"Pairs List Error: {e}")
             bot.send_message(call.message.chat.id, f"❌ Error loading pairs: {e}")
 
+    elif data.startswith("pair_userbots_list|"):
+        bot.answer_callback_query(call.id)
+        prefix = data.split("|")[1]
+        sessions = get_userbot_sessions()
+        
+        text = "👤 **Select Userbot Client**\n\nChoose the userbot account you want to use for browsing and selecting chats:\n\n"
+        
+        markup = InlineKeyboardMarkup(row_width=1)
+        selected_uid = None
+        if uid in login_data:
+            selected_uid = login_data[uid].get("userbot_id")
+            
+        for s in sessions:
+            db_id, phone, api_id, api_hash, session_string, u_id, username, first_name, is_active = s
+            client = userbot_fleet_manager.get_client(u_id)
+            is_connected = client.is_connected() if client else False
+            status_emoji = "🟢" if is_connected else "🔴"
+            
+            indicator = "✅ " if u_id == selected_uid else ""
+            button_text = f"{indicator}{status_emoji} {first_name} (@{username or 'No Username'})"
+            markup.add(InlineKeyboardButton(button_text, callback_data=f"pair_userbots_select|{prefix}|{u_id}"))
+            
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_userbots_back|{prefix}"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("pair_userbots_select|"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("|")
+        prefix = parts[1]
+        target_u_id = int(parts[2])
+        
+        if uid not in login_data:
+            login_data[uid] = {}
+        login_data[uid]["userbot_id"] = target_u_id
+        
+        client = userbot_fleet_manager.get_client(target_u_id)
+        if not client or not client.is_connected():
+            sessions = get_userbot_sessions()
+            sess = [s for s in sessions if s[5] == target_u_id]
+            if sess:
+                try:
+                    bot.send_message(call.message.chat.id, "🔄 Starting the selected userbot client in the background...")
+                    async def start_client_and_notify():
+                        try:
+                            await userbot_fleet_manager.start_client(sess[0])
+                            bot.send_message(call.message.chat.id, f"✅ Selected userbot `{sess[0][7]}` started successfully.")
+                            client_now = userbot_fleet_manager.get_client(target_u_id)
+                            markup = await get_chat_selection_markup(prefix, 0, client=client_now)
+                            if markup:
+                                msg_text = "🎯 *Select Source Chat*\nChoose the group or channel to collect from:" if prefix == "sel_src" else "🎯 *Select Target Chat*\nChoose the group or channel to send to:"
+                                bot.send_message(call.message.chat.id, msg_text, reply_markup=markup, parse_mode="Markdown")
+                        except Exception as start_err:
+                            bot.send_message(call.message.chat.id, f"❌ Failed to start userbot: {start_err}")
+                    asyncio.run_coroutine_threadsafe(start_client_and_notify(), loop)
+                except Exception as e:
+                    bot.send_message(call.message.chat.id, f"❌ Error starting selected userbot: {e}")
+            else:
+                bot.send_message(call.message.chat.id, "❌ Selected userbot session not found in database.")
+            return
+            
+        async def show_chat_selection():
+            markup = await get_chat_selection_markup(prefix, 0, client=client)
+            if markup:
+                msg_text = "🎯 *Select Source Chat*\nChoose the group or channel to collect from:" if prefix == "sel_src" else "🎯 *Select Target Chat*\nChoose the group or channel to send to:"
+                bot.edit_message_text(msg_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            else:
+                bot.edit_message_text("❌ No chats found on this userbot client.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
+        asyncio.run_coroutine_threadsafe(show_chat_selection(), loop)
+
+    elif data.startswith("pair_userbots_back|"):
+        bot.answer_callback_query(call.id)
+        prefix = data.split("|")[1]
+        
+        async def go_back():
+            client_id = login_data.get(uid, {}).get("userbot_id")
+            client = userbot_fleet_manager.get_client(client_id) if client_id else None
+            markup = await get_chat_selection_markup(prefix, 0, client=client)
+            msg_text = "🎯 *Select Source Chat*\nChoose the group or channel to collect from:" if prefix == "sel_src" else "🎯 *Select Target Chat*\nChoose the group or channel to send to:"
+            bot.edit_message_text(msg_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(go_back(), loop)
+
     elif data == "pair_add_start":
         bot.answer_callback_query(call.id, "🔍 Loading your chats...")
         async def show_src_list():
@@ -5907,11 +6230,9 @@ def handle_callbacks(call):
                     bot.send_message(call.message.chat.id, f"❌ Userbot connection failed: {msg}\n\nPlease go to *👤 User Account* and ensure your session is active.")
                     return
                 
-                # Clear selected userbot when starting a new pair pairing wizard
-                if uid in login_data:
-                    login_data[uid].pop("pairing_userbot_id", None)
-                    
-                markup = await get_chat_selection_markup("sel_src", 0)
+                client_id = login_data.get(uid, {}).get("userbot_id")
+                client = userbot_fleet_manager.get_client(client_id) if client_id else None
+                markup = await get_chat_selection_markup("sel_src", 0, client=client)
                 if markup:
                     bot.edit_message_text("🎯 *Select Source Chat*\nChoose the group or channel to collect from:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                 else:
@@ -5942,8 +6263,8 @@ def handle_callbacks(call):
             asyncio.run_coroutine_threadsafe(finalize_pair_task(call, uid), loop)
         else:
             async def show_tgt():
-                userbot_id = login_data.get(uid, {}).get("pairing_userbot_id")
-                client = userbot_fleet_manager.get_client(userbot_id) if userbot_id else None
+                client_id = login_data.get(uid, {}).get("userbot_id")
+                client = userbot_fleet_manager.get_client(client_id) if client_id else None
                 markup = await get_chat_selection_markup("sel_tgt", 0, client=client)
                 bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             asyncio.run_coroutine_threadsafe(show_tgt(), loop)
@@ -5960,8 +6281,8 @@ def handle_callbacks(call):
         if parts[2] == "page":
             page = int(parts[3])
             async def update_src_list():
-                userbot_id = login_data.get(uid, {}).get("pairing_userbot_id")
-                client = userbot_fleet_manager.get_client(userbot_id) if userbot_id else None
+                client_id = login_data.get(uid, {}).get("userbot_id")
+                client = userbot_fleet_manager.get_client(client_id) if client_id else None
                 markup = await get_chat_selection_markup("sel_src", page, client=client)
                 if markup:
                     bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
@@ -5970,8 +6291,8 @@ def handle_callbacks(call):
             sid = int(parts[2])
             async def handle_src():
                 try:
-                    userbot_id = login_data.get(uid, {}).get("pairing_userbot_id")
-                    client = userbot_fleet_manager.get_client(userbot_id) if userbot_id else userbot
+                    client_id = login_data.get(uid, {}).get("userbot_id")
+                    client = userbot_fleet_manager.get_client(client_id) if client_id else userbot
                     full_chat = await resolve_target_id(client, sid)
                     is_forum = getattr(full_chat, "forum", False)
                     
@@ -6015,8 +6336,8 @@ def handle_callbacks(call):
         if parts[2] == "page":
             page = int(parts[3])
             async def update_tgt_list():
-                userbot_id = login_data.get(uid, {}).get("pairing_userbot_id")
-                client = userbot_fleet_manager.get_client(userbot_id) if userbot_id else None
+                client_id = login_data.get(uid, {}).get("userbot_id")
+                client = userbot_fleet_manager.get_client(client_id) if client_id else None
                 markup = await get_chat_selection_markup("sel_tgt", page, client=client)
                 if markup:
                     bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
@@ -6025,8 +6346,8 @@ def handle_callbacks(call):
             tid = int(parts[2])
             async def handle_tgt():
                 try:
-                    userbot_id = login_data.get(uid, {}).get("pairing_userbot_id")
-                    client = userbot_fleet_manager.get_client(userbot_id) if userbot_id else userbot
+                    client_id = login_data.get(uid, {}).get("userbot_id")
+                    client = userbot_fleet_manager.get_client(client_id) if client_id else userbot
                     full_chat = await resolve_target_id(client, tid)
                     is_forum = getattr(full_chat, "forum", False)
                     
@@ -6079,6 +6400,80 @@ def handle_callbacks(call):
             c.execute(f"UPDATE target_pairs SET is_mirror = {p} WHERE id = {p}", (new_val, pid))
         bot.answer_callback_query(call.id, f"Mirror Mode {'Enabled' if new_val else 'Disabled'}")
         asyncio.run_coroutine_threadsafe(show_pair_view(call.message.chat.id, call.message.message_id, pid), loop)
+
+    elif data.startswith("pair_toggle_caption_sub_"):
+        pid = int(data.split("_")[-1])
+        remove_caption_ids = get_pair_remove_caption_ids(pid)
+        new_val = "0" if remove_caption_ids == "*" else "*"
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET remove_caption = {p}, remove_caption_ids = {p} WHERE id = {p}", (1 if new_val == "*" else 0, new_val, pid))
+        bot.answer_callback_query(call.id, f"Captions Strip: {'All' if new_val == '*' else 'Keep'}")
+        asyncio.run_coroutine_threadsafe(show_set_ids_menu(call.message.chat.id, call.message.message_id, pid), loop)
+
+    elif data.startswith("pair_toggle_fwd_sub_"):
+        pid = int(data.split("_")[-1])
+        remove_fwd_ids = get_pair_remove_fwd_ids(pid)
+        new_val = "0" if remove_fwd_ids == "*" else "*"
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET remove_fwd_ids = {p} WHERE id = {p}", (new_val, pid))
+        bot.answer_callback_query(call.id, f"Fwd Tag Strip: {'All' if new_val == '*' else 'Keep'}")
+        asyncio.run_coroutine_threadsafe(show_set_ids_menu(call.message.chat.id, call.message.message_id, pid), loop)
+
+    elif data.startswith("pair_toggle_caption_"):
+        pid = int(data.split("_")[-1])
+        remove_caption_ids = get_pair_remove_caption_ids(pid)
+        new_val = "0" if remove_caption_ids == "*" else "*"
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET remove_caption = {p}, remove_caption_ids = {p} WHERE id = {p}", (1 if new_val == "*" else 0, new_val, pid))
+        bot.answer_callback_query(call.id, f"Captions Strip: {'All' if new_val == '*' else 'Keep'}")
+        asyncio.run_coroutine_threadsafe(show_pair_view(call.message.chat.id, call.message.message_id, pid), loop)
+
+    elif data.startswith("pair_toggle_fwd_"):
+        pid = int(data.split("_")[-1])
+        remove_fwd_ids = get_pair_remove_fwd_ids(pid)
+        new_val = "0" if remove_fwd_ids == "*" else "*"
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET remove_fwd_ids = {p} WHERE id = {p}", (new_val, pid))
+        bot.answer_callback_query(call.id, f"Fwd Tag Strip: {'All' if new_val == '*' else 'Keep'}")
+        asyncio.run_coroutine_threadsafe(show_pair_view(call.message.chat.id, call.message.message_id, pid), loop)
+
+    elif data.startswith("pair_set_ids_menu_"):
+        pid = int(data.split("_")[-1])
+        asyncio.run_coroutine_threadsafe(show_set_ids_menu(call.message.chat.id, call.message.message_id, pid), loop)
+
+    elif data.startswith("pair_edit_cap_ids_"):
+        pid = int(data.split("_")[-1])
+        admin_states[uid] = f"awaiting_caption_ids_{pid}"
+        text = (
+            "📝 **Set Caption Strip IDs**\n\n"
+            "Please send the Telegram User/Channel/Bot IDs for which captions should be removed, separated by commas.\n\n"
+            "• Send `*` or `all` to strip captions for **all** messages.\n"
+            "• Send specific IDs (e.g. `-1001234567, 987654321`) to strip captions **only** for those entities.\n"
+            "• Send `0` or `off` to **keep** captions for everyone."
+        )
+        bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+
+    elif data.startswith("pair_edit_fwd_ids_"):
+        pid = int(data.split("_")[-1])
+        admin_states[uid] = f"awaiting_fwd_ids_{pid}"
+        text = (
+            "🏷️ **Set Forward Tag Strip IDs**\n\n"
+            "Please send the Telegram User/Channel/Bot IDs for which forward tags should be removed, separated by commas.\n\n"
+            "• Send `*` or `all` to strip forward tags for **all** messages.\n"
+            "• Send specific IDs (e.g. `-1001234567, 987654321`) to strip forward tags **only** for those entities.\n"
+            "• Send `0` or `off` to **keep** forward tags for everyone."
+        )
+        bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
 
     elif data.startswith("pair_toggle_filter_"):
         pid = int(data.split("_")[-1])
@@ -6690,6 +7085,38 @@ def handle_state_inputs(message):
 
 
 
+    elif state.startswith("awaiting_caption_ids_"):
+        pid = int(state.replace("awaiting_caption_ids_", ""))
+        admin_states.pop(uid, None)
+        val = text
+        if val.lower() in ["all", "*"]:
+            val = "*"
+        elif val.lower() in ["0", "off", "keep", "none"]:
+            val = "0"
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET remove_caption = {p}, remove_caption_ids = {p} WHERE id = {p}", (1 if val == "*" or (val != "0" and val != "") else 0, val, pid))
+            conn.commit()
+        bot.reply_to(message, f"✅ Caption strip IDs updated to: `{val}`")
+        asyncio.run_coroutine_threadsafe(show_set_ids_menu(message.chat.id, None, pid), loop)
+
+    elif state.startswith("awaiting_fwd_ids_"):
+        pid = int(state.replace("awaiting_fwd_ids_", ""))
+        admin_states.pop(uid, None)
+        val = text
+        if val.lower() in ["all", "*"]:
+            val = "*"
+        elif val.lower() in ["0", "off", "keep", "none"]:
+            val = "0"
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET remove_fwd_ids = {p} WHERE id = {p}", (val, pid))
+            conn.commit()
+        bot.reply_to(message, f"✅ Forward tag strip IDs updated to: `{val}`")
+        asyncio.run_coroutine_threadsafe(show_set_ids_menu(message.chat.id, None, pid), loop)
+
     elif state.startswith("awaiting_new_topic_name_"):
         chat_id = int(state.replace("awaiting_new_topic_name_", ""))
         topic_title = text
@@ -6700,8 +7127,11 @@ def handle_state_inputs(message):
         async def create_and_select():
             try:
                 from telethon.tl.functions.channels import CreateForumTopicRequest
-                entity = await resolve_target_id(userbot, chat_id)
-                result = await userbot(CreateForumTopicRequest(
+                client_id = login_data.get(uid, {}).get("userbot_id")
+                client = userbot_fleet_manager.get_client(client_id) if client_id else userbot
+                
+                entity = await resolve_target_id(client, chat_id)
+                result = await client(CreateForumTopicRequest(
                     channel=entity,
                     title=topic_title
                 ))
@@ -6734,11 +7164,11 @@ def handle_state_inputs(message):
                 if login_data[uid].get("preselected_flow") == "target":
                     tid = login_data[uid]["target_id"]
                     ttid = login_data[uid]["target_topic_id"]
-                    t_chat = await resolve_target_id(userbot, tid)
+                    t_chat = await resolve_target_id(client, tid)
                     s_title = getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or str(chat_id)
                     t_title = getattr(t_chat, 'title', None) or getattr(t_chat, 'first_name', None) or str(tid)
                     
-                    add_target_pair(chat_id, topic_id, tid, ttid, s_title, t_title)
+                    add_target_pair(chat_id, topic_id, tid, ttid, s_title, t_title, userbot_id=client_id)
                     
                     success_text = f"✅ *Pair Added!*\n\n"
                     success_text += f"Source: `{s_title}` (Topic: `{topic_id}`)\n"
@@ -6748,7 +7178,7 @@ def handle_state_inputs(message):
                     bot.send_message(message.chat.id, "🎯 *Target Pairs*", reply_markup=pairs_list_markup())
                     login_data.pop(uid, None)
                 else:
-                    markup = await get_chat_selection_markup("sel_tgt", 0)
+                    markup = await get_chat_selection_markup("sel_tgt", 0, client=client)
                     bot.send_message(message.chat.id, "🎯 *Select Target Chat*\nChoose the group or channel to send to:", reply_markup=markup, parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Error creating topic: {e}")
@@ -6912,6 +7342,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     
     pair = get_target_pair(pair_id)
     if not pair: return
+    remove_caption_ids = get_pair_remove_caption_ids(pair_id)
+    remove_fwd_ids = get_pair_remove_fwd_ids(pair_id)
     pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = pair
     history_options[task_key]["s_title"] = s_title
     
@@ -6923,9 +7355,16 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     status_msg = bot.send_message(admin_chat_id, f"📜 *History Scrape: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
-        client, target_chat = await resolve_target_across_fleet(sid)
+        assigned_ub_id = get_pair_userbot_id(pair_id)
+        client = userbot_fleet_manager.get_client(assigned_ub_id) if assigned_ub_id else None
+        target_chat = None
+        if client:
+            try: target_chat = await resolve_target_id(client, sid)
+            except Exception: pass
+        if not target_chat:
+            client, target_chat = await resolve_target_across_fleet(sid)
         if not client:
-            client = userbot
+            client = globals()['userbot']
             target_chat = await resolve_target_id(client, sid)
         userbot = client
         
@@ -6946,13 +7385,14 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 break
                 
             async with userbot_lock:
-                chunk = await userbot.get_messages(
-                    target_chat,
-                    limit=chunk_size,
-                    min_id=offset_id,
-                    reply_to=target_topic,
-                    reverse=True
-                )
+                kwargs = {
+                    "limit": chunk_size,
+                    "min_id": offset_id,
+                    "reverse": True
+                }
+                if target_topic is not None:
+                    kwargs["reply_to"] = target_topic
+                chunk = await userbot.get_messages(target_chat, **kwargs)
             
             if not chunk:
                 break
@@ -7088,12 +7528,14 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 
             try:
                 has_media = any(msg.media for msg in batch)
-                if is_protected_flow:
-                    if has_media and not any(msg.id in media_to_file for msg in batch):
+                strip_caption = any(should_strip_option(remove_caption_ids, msg) for msg in batch)
+                strip_fwd = any(should_strip_option(remove_fwd_ids, msg) for msg in batch)
+                if is_protected_flow or strip_caption or strip_fwd:
+                    if is_protected_flow and has_media and not any(msg.id in media_to_file for msg in batch):
                         logger.warning("🛡️ SCRAPE: Skipping mirror because media download failed/skipped.")
                     else:
                         async with userbot_lock:
-                            await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
+                            await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None, pair_id=pair_id)
                 else:
                     try:
                         async with userbot_lock:
@@ -7154,7 +7596,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     except Exception as fwd_err:
                         logger.error(f"Native Forward in history scrape failed ({fwd_err}). Falling back to mirror...")
                         async with userbot_lock:
-                            await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid)
+                            await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid, pair_id=pair_id)
                 
                 sent_count += len(batch)
                 
@@ -7268,9 +7710,16 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 async def resolve_target_id(client: TelegramClient, target_ref):
     from telethon.tl.types import PeerChannel, PeerChat, PeerUser
     
-    # Try resolving target_ref directly
+    # Pre-parse target_ref if it is a string representation of an integer
+    parsed_ref = target_ref
+    if isinstance(target_ref, str):
+        cleaned = target_ref.strip()
+        if cleaned.replace("-", "").isdigit():
+            parsed_ref = int(cleaned)
+
+    # Try resolving parsed_ref directly from the client's memory/db cache
     try:
-        entity = await client.get_entity(target_ref)
+        entity = await client.get_entity(parsed_ref)
         if entity and not isinstance(entity, int):
             try:
                 from telethon.tl.types import Channel, Chat
@@ -7309,12 +7758,6 @@ async def resolve_target_id(client: TelegramClient, target_ref):
         clean_id_int = int(clean_id)
         
         # Candidates to try:
-        # 1. PeerChannel(clean_id_int) -> standard channel
-        # 2. PeerChat(clean_id_int) -> standard chat
-        # 3. PeerUser(clean_id_int) -> standard user
-        # 4. int(f"-100{clean_id}")
-        # 5. -clean_id_int
-        # 6. clean_id_int
         candidates = [
             PeerChannel(clean_id_int),
             PeerChat(clean_id_int),
@@ -7331,10 +7774,11 @@ async def resolve_target_id(client: TelegramClient, target_ref):
             except Exception:
                 pass
                 
-        # Second attempt: fetch dialogs from network to refresh entity cache
+        # Second attempt: fetch only a limited set of recent dialogs (e.g. 50) to update the cache
+        # This is extremely fast (< 0.5s) compared to full get_dialogs()
         try:
-            logger.info("Target entity not found in cache. Refreshing dialogs from Telegram network...")
-            await client.get_dialogs()
+            logger.info("Target entity not found in cache. Refreshing recent dialogs...")
+            await client.get_dialogs(limit=50)
             
             # Retry candidates after refreshing cache
             for candidate in candidates:
@@ -7343,11 +7787,11 @@ async def resolve_target_id(client: TelegramClient, target_ref):
                 except Exception:
                     pass
         except Exception as ex:
-            logger.error(f"Failed to refresh dialogs: {ex}")
+            logger.error(f"Failed to refresh recent dialogs: {ex}")
             
-        # Third attempt: search dialogs list manually
+        # Third attempt: search dialogs list manually up to limit=100
         try:
-            async for dialog in client.iter_dialogs(limit=200):
+            async for dialog in client.iter_dialogs(limit=100):
                 d_id_str = str(dialog.id).replace("-100", "").replace("-", "")
                 if d_id_str == clean_id:
                     return dialog.entity
@@ -7391,9 +7835,16 @@ async def run_collection_preview(admin_chat_id, message_id, pair_id):
         pass
 
     try:
-        client, source_chat = await resolve_target_across_fleet(sid)
+        assigned_ub_id = get_pair_userbot_id(pair_id)
+        client = userbot_fleet_manager.get_client(assigned_ub_id) if assigned_ub_id else None
+        source_chat = None
+        if client:
+            try: source_chat = await resolve_target_id(client, sid)
+            except Exception: pass
+        if not source_chat:
+            client, source_chat = await resolve_target_across_fleet(sid)
         if not client:
-            client = userbot
+            client = globals()['userbot']
             source_chat = await resolve_target_id(client, sid)
         userbot = client
         
@@ -7411,16 +7862,22 @@ async def run_collection_preview(admin_chat_id, message_id, pair_id):
         text_count = 0
         
         # We fetch up to 1000 messages or use limit/get_messages to count types quickly
-        async with userbot_lock:
+        if True:
             # Let's get total count first
-            total_msg = await userbot.get_messages(source_chat, limit=0, reply_to=target_topic)
+            if target_topic is not None:
+                total_msg = await userbot.get_messages(source_chat, limit=0, reply_to=target_topic)
+            else:
+                total_msg = await userbot.get_messages(source_chat, limit=0)
             total_count = total_msg.total
             
             # Fast scan of the last 1000 messages to estimate type distribution
             scan_limit = min(total_count, 1000)
             if scan_limit > 0:
                 try:
-                    messages = await userbot.get_messages(source_chat, limit=scan_limit, reply_to=target_topic)
+                    if target_topic is not None:
+                        messages = await userbot.get_messages(source_chat, limit=scan_limit, reply_to=target_topic)
+                    else:
+                        messages = await userbot.get_messages(source_chat, limit=scan_limit)
                     for m in messages:
                         m_type = get_specific_media_type(m.media)
                         if m_type == "photo":
@@ -7528,36 +7985,48 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         
     task_key = f"coll_{pair_id}"
     running_tasks[task_key] = True
+    set_setting(f"collection_running_{pair_id}", 1)
         
     row = get_target_pair(pair_id)
     if not row:
         logger.error(f"Target pair {pair_id} not found in database.")
         return
+    remove_caption_ids = get_pair_remove_caption_ids(pair_id)
+    remove_fwd_ids = get_pair_remove_fwd_ids(pair_id)
     pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = row
-    collected = 0
-    scanned = 0
-    sent_count = 0
+    offset_id = int(get_setting(f"last_offset_{pair_id}", 0))
+    is_fresh = (offset_id == 0)
     
+    # DIRECT ASSIGNMENT (Do not use .clear() to prevent reading empty dictionaries during async switches)
+    existing_opts = collection_options.get(task_key, {})
+    
+    scanned = 0 if is_fresh else existing_opts.get("scanned", 0)
+    collected = 0 if is_fresh else existing_opts.get("collected", 0)
+    duplicates = 0 if is_fresh else existing_opts.get("duplicates", 0)
+    deleted = 0 if is_fresh else existing_opts.get("deleted", 0)
+    skipped = 0 if is_fresh else existing_opts.get("skipped", 0)
+    filtered = 0 if is_fresh else existing_opts.get("filtered", 0)
+    sent_count = 0 if is_fresh else existing_opts.get("sent_count", 0)
+    progress = 0 if is_fresh else existing_opts.get("progress", 0)
+
     default_cf = cf or "everything"
     if default_cf not in ["everything", "media", "text", "file"]:
         default_cf = "everything"
         
-    # DIRECT ASSIGNMENT (Do not use .clear() to prevent reading empty dictionaries during async switches)
-    existing_opts = collection_options.get(task_key, {})
     collection_options[task_key] = {
         "instant_release": existing_opts.get("instant_release", bool(is_live)),
         "instant_filter": existing_opts.get("instant_filter", "everything"),
         "collect_filter": existing_opts.get("collect_filter", default_cf),
         "s_title": s_title,
-        "scanned": existing_opts.get("scanned", 0),
-        "collected": existing_opts.get("collected", 0),
-        "duplicates": existing_opts.get("duplicates", 0),
-        "deleted": existing_opts.get("deleted", 0),
-        "skipped": existing_opts.get("skipped", 0),
-        "filtered": existing_opts.get("filtered", 0),
+        "scanned": scanned,
+        "collected": collected,
+        "duplicates": duplicates,
+        "deleted": deleted,
+        "skipped": skipped,
+        "filtered": filtered,
         "limit": limit,
-        "sent_count": existing_opts.get("sent_count", 0),
-        "progress": existing_opts.get("progress", 0),
+        "sent_count": sent_count,
+        "progress": progress,
         "status": "Fetching"
     }
     
@@ -7569,11 +8038,68 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         parse_mode="HTML"
     )
     
+    should_clear_running_flag = True
     try:
+        assigned_ub_id = get_pair_userbot_id(pair_id)
+        client = userbot_fleet_manager.get_client(assigned_ub_id) if assigned_ub_id else None
+        target_chat_test = None
+        if client:
+            try: target_chat_test = await resolve_target_id(client, sid)
+            except Exception: pass
+        if not target_chat_test:
+            client, target_chat_test = await resolve_target_across_fleet(sid)
+        if not client:
+            client = globals()['userbot']
+        userbot = client
+
         logger.info("Resolving source chat")
-        source_chat = await resolve_target_id(userbot, sid)
-        logger.info("Resolving target chat")
-        dest_chat = await resolve_target_id(userbot, tid)
+        try:
+            source_chat = await resolve_target_id(userbot, sid)
+            logger.info("Resolving target chat")
+            dest_chat = await resolve_target_id(userbot, tid)
+            
+            try:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    c.execute(f"DELETE FROM banned_users WHERE user_id = {p}", (sid,))
+                    s_uname = getattr(source_chat, 'username', None)
+                    if s_uname:
+                        clean_uname = s_uname.lower().replace("@", "")
+                        c.execute(f"DELETE FROM banned_users WHERE username = {p}", (clean_uname,))
+                    c.execute(f"DELETE FROM banned_users WHERE user_id = {p}", (tid,))
+                    t_uname = getattr(dest_chat, 'username', None)
+                    if t_uname:
+                        clean_t_uname = t_uname.lower().replace("@", "")
+                        c.execute(f"DELETE FROM banned_users WHERE username = {p}", (clean_t_uname,))
+                    conn.commit()
+                    logger.info(f"Automatically ensured source chat {sid} (@{s_uname}) and target chat {tid} (@{t_uname}) are unbanned.")
+            except Exception as ube:
+                logger.error(f"Failed to auto-unban source/target chats: {ube}")
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "private" in err_msg or "access" in err_msg or "could not find or access chat" in err_msg or "invalid" in err_msg:
+                logger.warning(f"Userbot appears to have been kicked or left target pair {pair_id}: {e}")
+                pause_pair(pair_id)
+                should_clear_running_flag = False
+                try:
+                    bot.send_message(admin_chat_id, f"⚠️ **Userbot has been kicked or left the group/channel!**\n\n**Source:** {s_title}\n**Target:** {t_title}\n\nLive mirroring and collection have been paused. They will resume automatically when the userbot rejoins the group.")
+                except Exception: pass
+                
+                opts = collection_options.get(task_key, {})
+                opts["status"] = "Paused (Kicked/Left)"
+                try:
+                    bot.edit_message_text(
+                        get_collection_status_text(task_key),
+                        admin_chat_id,
+                        status_msg.message_id,
+                        reply_markup=get_collection_markup(pair_id),
+                        parse_mode="HTML"
+                    )
+                except Exception: pass
+                return
+            else:
+                raise e
         
         target_topic = None
         if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
@@ -7582,10 +8108,14 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             except Exception:
                 pass
         
+        last_edit_time = [0.0]
         total_count = 0
         try:
-            async with userbot_lock:
-                total_msg = await userbot.get_messages(source_chat, limit=0, reply_to=target_topic)
+            if True:
+                if target_topic is not None:
+                    total_msg = await userbot.get_messages(source_chat, limit=0, reply_to=target_topic)
+                else:
+                    total_msg = await userbot.get_messages(source_chat, limit=0)
                 total_count = total_msg.total
         except Exception as e:
             logger.warning(f"Could not get total message count: {e}")
@@ -7593,20 +8123,20 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         total_to_fetch = min(limit, total_count) if limit and total_count else (total_count or limit or 1)
         if total_to_fetch <= 0:
             total_to_fetch = 1
-
         opts = collection_options[task_key]
         opts["status"] = "Fetching"
         
-        offset_id = 0
+        offset_id = int(get_setting(f"last_offset_{pair_id}", 0))
+        logger.info(f"Collection initialized for pair {pair_id}. Starting from offset_id = {offset_id}")
         chunk_size = 100
-        to_fetch_remain = limit if limit else total_count
+        to_fetch_remain = limit if limit is not None else (total_count if total_count > 0 else None)
         
         auto_mirror = is_mir
         is_protected_flow = getattr(source_chat, 'noforwards', False)
         if is_protected_flow:
             try:
                 from telethon.tl.functions.channels import GetChannelsRequest
-                async with userbot_lock:
+                if True:
                     res = await userbot(GetChannelsRequest(id=[source_chat]))
                 if res and res.chats:
                     source_chat = res.chats[0]
@@ -7615,26 +8145,60 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             except Exception:
                 pass
 
+        logger.info(f"Starting collection loop. to_fetch_remain={to_fetch_remain}, offset_id={offset_id}")
         while to_fetch_remain is None or to_fetch_remain > 0:
             if not running_tasks.get(task_key):
+                logger.info("Collection loop aborted: task is no longer active in running_tasks.")
                 break
                 
             cur_limit = chunk_size if to_fetch_remain is None else min(chunk_size, to_fetch_remain)
             if cur_limit <= 0:
+                logger.info(f"Collection loop finished: cur_limit {cur_limit} <= 0.")
                 break
                 
-            async with userbot_lock:
-                chunk = await userbot.get_messages(
-                    source_chat,
-                    limit=cur_limit,
-                    min_id=offset_id,
-                    reply_to=target_topic,
-                    reverse=True
-                )
+            if True:
+                try:
+                    get_messages_kwargs = {
+                        "limit": cur_limit,
+                        "reverse": True
+                    }
+                    if target_topic is not None:
+                        get_messages_kwargs["reply_to"] = target_topic
+                    if offset_id > 0:
+                        get_messages_kwargs["min_id"] = offset_id
+                    
+                    logger.info(f"Fetching messages chunk: {get_messages_kwargs}")
+                    chunk = await userbot.get_messages(source_chat, **get_messages_kwargs)
+                    logger.info(f"Fetched chunk size: {len(chunk) if chunk else 0}")
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if "private" in err_msg or "access" in err_msg or "kicked" in err_msg or "forbidden" in err_msg or "invalid" in err_msg:
+                        logger.warning(f"Userbot kicked/left during collection loop for pair {pair_id}: {e}")
+                        pause_pair(pair_id)
+                        should_clear_running_flag = False
+                        try:
+                            bot.send_message(admin_chat_id, f"⚠️ **Userbot has been kicked or left the group during collection!**\n\n**Source:** {s_title}\n**Target:** {t_title}\n\nCollection paused at message ID `{offset_id}`. Live mirroring is also paused.")
+                        except Exception: pass
+                        opts = collection_options.get(task_key, {})
+                        opts["status"] = "Paused (Kicked/Left)"
+                        try:
+                            bot.edit_message_text(
+                                get_collection_status_text(task_key),
+                                admin_chat_id,
+                                status_msg.message_id,
+                                reply_markup=get_collection_markup(pair_id),
+                                parse_mode="HTML"
+                            )
+                        except Exception: pass
+                        return
+                    else:
+                        raise e
                 
             if not chunk:
                 break
                 
+            cf_val = opts.get("collect_filter", "everything")
+            logger.info(f"Processing chunk of {len(chunk)} messages. collect_filter={cf_val}")
             chunk_valid = []
             for m in chunk:
                 scanned += 1
@@ -7644,6 +8208,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 if isinstance(m, types.MessageService):
                     opts["filtered"] += 1
                     opts.update({"scanned": scanned, "progress": progress})
+                    logger.info(f"Filtered message {m.id} in collection: MessageService type")
                     continue
                 
                 sender_id = m.sender_id
@@ -7651,6 +8216,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 if is_user_banned(sender_id, sender_username):
                     opts["filtered"] += 1
                     opts.update({"scanned": scanned, "progress": progress})
+                    logger.info(f"Filtered message {m.id} in collection: Sender {sender_id} (@{sender_username}) is banned")
                     continue
                 
                 cf_val = opts.get("collect_filter", "everything")
@@ -7661,14 +8227,17 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     if cf_val == "media" and m_type not in ["photo", "video"]:
                         opts["filtered"] += 1
                         opts.update({"scanned": scanned, "progress": progress})
+                        logger.info(f"Filtered message {m.id} in collection: Media filter ({m_type})")
                         continue
                     if cf_val == "text" and m_type != "text":
                         opts["filtered"] += 1
                         opts.update({"scanned": scanned, "progress": progress})
+                        logger.info(f"Filtered message {m.id} in collection: Text filter ({m_type})")
                         continue
                     if cf_val == "file" and m_type != "file":
                         opts["filtered"] += 1
                         opts.update({"scanned": scanned, "progress": progress})
+                        logger.info(f"Filtered message {m.id} in collection: File filter ({m_type})")
                         continue
                 
                 is_dup = False
@@ -7737,45 +8306,48 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     media_to_file = {}
                     download_targets = matching_batch if curr_instant else (batch if should_vault else [])
                     if is_protected_flow and download_targets:
-                        for msg in download_targets:
-                            if msg.media:
-                                try:
-                                    async with userbot_lock:
+                        media_msgs = [msg for msg in download_targets if msg.media]
+                        async def safe_collect_download(msg):
+                            try:
+                                async with media_semaphore:
+                                    return await asyncio.wait_for(userbot.download_media(msg), timeout=20.0)
+                            except errors.FloodWaitError as fwe:
+                                logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                                await notify_admin_flood_wait(userbot, "Collection Download", fwe.seconds)
+                                if fwe.seconds <= 5:
+                                    await asyncio.sleep(fwe.seconds)
+                                    try:
                                         async with media_semaphore:
-                                            path = await userbot.download_media(msg)
-                                    if path:
-                                        media_to_file[msg.id] = path
-                                except errors.FloodWaitError as fwe:
-                                    logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
-                                    await notify_admin_flood_wait(userbot, "Collection Download", fwe.seconds)
-                                    if fwe.seconds <= 5:
-                                        await asyncio.sleep(fwe.seconds)
-                                        try:
-                                            async with userbot_lock:
-                                                async with media_semaphore:
-                                                    path = await userbot.download_media(msg)
-                                            if path: media_to_file[msg.id] = path
-                                        except Exception as e2:
-                                            logger.error(f"Failed to download media after short flood wait: {e2}")
-                                except Exception as e:
-                                    logger.error(f"Failed to download media for message {msg.id}: {e}")
+                                            return await asyncio.wait_for(userbot.download_media(msg), timeout=20.0)
+                                    except Exception as e2:
+                                        logger.error(f"Failed to download media after short flood wait: {e2}")
+                            except Exception as de:
+                                logger.error(f"Failed to download media for message {msg.id}: {de}")
+                            return None
+
+                        paths = await asyncio.gather(*(safe_collect_download(msg) for msg in media_msgs))
+                        for msg, path in zip(media_msgs, paths):
+                            if path:
+                                media_to_file[msg.id] = path
 
                     try:
                         if curr_instant and matching_batch:
                             try:
                                 has_media = any(msg.media for msg in matching_batch)
                                 is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in matching_batch)
-                                if is_protected_flow or is_reply:
+                                strip_caption = any(should_strip_option(remove_caption_ids, msg) for msg in matching_batch)
+                                strip_fwd = any(should_strip_option(remove_fwd_ids, msg) for msg in matching_batch)
+                                if is_protected_flow or is_reply or strip_caption or strip_fwd:
                                     if is_protected_flow and has_media and not any(msg.id in media_to_file for msg in matching_batch):
                                         logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                                         opts["skipped"] += len(matching_batch)
                                     else:
-                                        async with userbot_lock:
-                                            await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
+                                        if True:
+                                            await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None, pair_id=pair_id)
                                         sent_count += len(matching_batch)
                                 else:
                                     try:
-                                        async with userbot_lock:
+                                        if True:
                                             src_peer = await userbot.get_input_entity(int(sid))
                                             tgt_peer = await userbot.get_input_entity(int(tid))
                                         
@@ -7797,16 +8369,16 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                                     src_icon = getattr(forum, "icon_emoji_id", None)
                                                     if not src_title:
                                                         try:
-                                                            async with userbot_lock:
-                                                                res = await userbot(functions.messages.GetForumTopicsRequest(
-                                                                    peer=src_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                                            if True:
+                                                                res = await userbot(functions.messages.GetForumTopicsByIDRequest(
+                                                                    peer=src_peer,
+                                                                    topics=[int(s_top)]
                                                                 ))
-                                                            for t in res.topics:
-                                                                if t.id == s_top:
-                                                                    src_title = t.title
-                                                                    src_icon = getattr(t, "icon_emoji_id", None)
-                                                                    break
-                                                        except Exception: pass
+                                                            if res and res.topics:
+                                                                src_title = res.topics[0].title
+                                                                src_icon = getattr(res.topics[0], "icon_emoji_id", None)
+                                                        except Exception as e:
+                                                            logger.error(f"Failed to fetch source topic title by ID {s_top} in queue processor 2: {e}")
                                                     if src_title:
                                                         dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
 
@@ -7816,7 +8388,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                         is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
                                         top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
                                         
-                                        async with userbot_lock:
+                                        if True:
                                             fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
                                                 from_peer=src_peer,
                                                 id=[msg.id for msg in matching_batch],
@@ -7836,8 +8408,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                         sent_count += len(matching_batch)
                                     except Exception as fwd_err:
                                         logger.error(f"Native Forward in collection failed ({fwd_err}). Falling back to mirror...")
-                                        async with userbot_lock:
-                                            await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
+                                        if True:
+                                            await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid, pair_id=pair_id)
                                         sent_count += len(matching_batch)
                             except Exception as fe:
                                 logger.error(f"Failed to forward batch: {fe}")
@@ -7919,16 +8491,16 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                                         src_icon = getattr(forum, "icon_emoji_id", None)
                                                         if not src_title:
                                                             try:
-                                                                async with userbot_lock:
-                                                                    res = await userbot(functions.messages.GetForumTopicsRequest(
-                                                                        peer=source_chat, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                                                if True:
+                                                                    res = await userbot(functions.messages.GetForumTopicsByIDRequest(
+                                                                        peer=source_chat,
+                                                                        topics=[int(s_top)]
                                                                     ))
-                                                                for t in res.topics:
-                                                                    if t.id == s_top:
-                                                                        src_title = t.title
-                                                                        src_icon = getattr(t, "icon_emoji_id", None)
-                                                                        break
-                                                            except Exception: pass
+                                                                if res and res.topics:
+                                                                    src_title = res.topics[0].title
+                                                                    src_icon = getattr(res.topics[0], "icon_emoji_id", None)
+                                                            except Exception as e:
+                                                                logger.error(f"Failed to fetch source topic title by ID {s_top} in queue processor vault: {e}")
                                                         if src_title:
                                                             vault_topic_id = await get_or_create_target_topic(
                                                                 userbot, int(bot_id), src_title, sid, s_top, icon_emoji_id=src_icon
@@ -7937,7 +8509,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                             logger.error(f"Error resolving topic for vault group {bot_id}: {topic_err}")
 
                                         try:
-                                            async with userbot_lock:
+                                            if True:
                                                 vaulted_result = await userbot.send_message(
                                                     entity=int(bot_id),
                                                     file=file_payload,
@@ -7971,6 +8543,22 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                         opts.update({
                             "sent_count": sent_count
                         })
+                        import time
+                        now = time.time()
+                        if now - last_edit_time[0] >= 3.0:
+                            is_task_active = running_tasks.get(task_key)
+                            if is_task_active:
+                                try:
+                                    bot.edit_message_text(
+                                        get_collection_status_text(task_key),
+                                        admin_chat_id,
+                                        status_msg.message_id,
+                                        reply_markup=get_collection_markup(pair_id),
+                                        parse_mode="HTML"
+                                    )
+                                    last_edit_time[0] = now
+                                except Exception:
+                                    pass
                         
                     if (curr_instant and matching_batch) or (should_vault and batch):
                         # Gradual release sleep delay to avoid bulk flood
@@ -7980,6 +8568,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 to_fetch_remain -= len(chunk)
                 
             offset_id = chunk[-1].id
+            set_setting(f"last_offset_{pair_id}", offset_id)
             
             is_task_active = running_tasks.get(task_key)
             if is_task_active:
@@ -8022,6 +8611,9 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
+        if should_clear_running_flag:
+            set_setting(f"collection_running_{pair_id}", 0)
+            set_setting(f"last_offset_{pair_id}", 0)
         running_tasks.pop(task_key, None)
         collection_options.pop(task_key, None)
 
@@ -8042,19 +8634,24 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
             row = c.fetchone()
         
         if not row: return
+        remove_caption_ids = get_pair_remove_caption_ids(pair_id)
         sid_ref, tid_ref, s_title, is_mir, s_topic, t_topic, cf = row
     
+        assigned_ub_id = get_pair_userbot_id(pair_id)
+        client = userbot_fleet_manager.get_client(assigned_ub_id) if assigned_ub_id else None
         source_chat = None
-        source_accessible = False
-        client, source_chat = await resolve_target_across_fleet(sid_ref)
+        if client:
+            try: source_chat = await resolve_target_id(client, sid_ref)
+            except Exception: pass
+        if not source_chat:
+            client, source_chat = await resolve_target_across_fleet(sid_ref)
         if not client:
-            client = userbot
-            try:
-                source_chat = await resolve_target_id(client, sid_ref)
-            except Exception:
-                pass
+            client = globals()['userbot']
+            try: source_chat = await resolve_target_id(client, sid_ref)
+            except Exception: pass
         userbot = client
         
+        source_accessible = False
         if source_chat:
             source_accessible = True
             
@@ -8205,17 +8802,16 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                             src_icon = getattr(forum, "icon_emoji_id", None)
                             if not src_title:
                                 try:
-                                    async with userbot_lock:
-                                        res = await userbot(functions.messages.GetForumTopicsRequest(
-                                            peer=source_chat, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                    if True:
+                                        res = await userbot(functions.messages.GetForumTopicsByIDRequest(
+                                            peer=source_chat,
+                                            topics=[int(s_top)]
                                         ))
-                                    for t in res.topics:
-                                        if t.id == s_top:
-                                            src_title = t.title
-                                            src_icon = getattr(t, "icon_emoji_id", None)
-                                            break
+                                    if res and res.topics:
+                                        src_title = res.topics[0].title
+                                        src_icon = getattr(res.topics[0], "icon_emoji_id", None)
                                 except Exception as e:
-                                    logger.error(f"Failed to fetch source forum topics in release: {e}")
+                                    logger.error(f"Failed to fetch source forum topic title by ID {s_top} in release: {e}")
                             
                             if src_title:
                                 target_topic_anchor = await get_or_create_target_topic(
@@ -8243,44 +8839,50 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                 # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
                 final_reply_target = reply_to_val if reply_to_val else target_topic_anchor
 
+                msg_caption = msg.message or ""
+                if should_strip_option(remove_caption_ids, msg) and msg.media:
+                    msg_caption = ""
+
                 sent_msg = None
                 try:
                     sent_msg = await userbot.send_message(
                         entity=target_chat,
-                        message=msg.message or "",
+                        message=msg_caption,
                         file=msg.media,
                         reply_to=int(final_reply_target) if final_reply_target else None
                     )
                 except Exception as e:
                     # If we had a reply target, attempt to fallback/downgrade reply first
                     if final_reply_target is not None:
-                        is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
-                        next_reply = None
-                        if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
-                            next_reply = int(target_topic_anchor)
-                        
-                        logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={final_reply_target} ({e}). Retrying with reply_to={next_reply}...")
-                        try:
-                            sent_msg = await userbot.send_message(
-                                entity=target_chat,
-                                message=msg.message or "",
-                                file=msg.media,
-                                reply_to=next_reply
-                            )
-                        except Exception as e2:
-                            if next_reply is not None:
-                                logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={next_reply} ({e2}). Retrying with reply_to=None...")
-                                try:
-                                    sent_msg = await userbot.send_message(
-                                        entity=target_chat,
-                                        message=msg.message or "",
-                                        file=msg.media,
-                                        reply_to=None
-                                    )
-                                except Exception as e3:
-                                    e = e3
-                            else:
-                                e = e2
+                        e_str = str(e).lower()
+                        if any(x in e_str for x in ["reply", "thread", "topic", "forum"]):
+                            is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
+                            next_reply = None
+                            if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
+                                next_reply = int(target_topic_anchor)
+                            
+                            logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={final_reply_target} ({e}). Retrying with reply_to={next_reply}...")
+                            try:
+                                sent_msg = await userbot.send_message(
+                                    entity=target_chat,
+                                    message=msg_caption,
+                                    file=msg.media,
+                                    reply_to=next_reply
+                                )
+                            except Exception as e2:
+                                if next_reply is not None:
+                                    logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={next_reply} ({e2}). Retrying with reply_to=None...")
+                                    try:
+                                        sent_msg = await userbot.send_message(
+                                            entity=target_chat,
+                                            message=msg_caption,
+                                            file=msg.media,
+                                            reply_to=None
+                                        )
+                                    except Exception as e3:
+                                        e = e3
+                                else:
+                                    e = e2
                     
                     # If still failed, check if we need to do fallback download & upload
                     if not sent_msg:
@@ -8298,40 +8900,44 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                                 try:
                                     sent_msg = await userbot.send_message(
                                         entity=target_chat,
-                                        message=msg.message or "",
+                                        message=msg_caption,
                                         file=local_file,
                                         reply_to=int(final_reply_target) if final_reply_target else None
                                     )
                                 except Exception as fe:
                                     # Downgrade in fallback as well
                                     if final_reply_target is not None:
-                                        is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
-                                        next_reply = None
-                                        if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
-                                            next_reply = int(target_topic_anchor)
-                                        
-                                        logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={final_reply_target} ({fe}). Retrying with reply_to={next_reply}...")
-                                        try:
-                                            sent_msg = await userbot.send_message(
-                                                entity=target_chat,
-                                                message=msg.message or "",
-                                                file=local_file,
-                                                reply_to=next_reply
-                                            )
-                                        except Exception as fe2:
-                                            if next_reply is not None:
-                                                logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={next_reply} ({fe2}). Retrying with reply_to=None...")
-                                                try:
-                                                    sent_msg = await userbot.send_message(
-                                                        entity=target_chat,
-                                                        message=msg.message or "",
-                                                        file=local_file,
-                                                        reply_to=None
-                                                    )
-                                                except Exception as fe3:
-                                                    raise fe3
-                                            else:
-                                                raise fe2
+                                        fe_str = str(fe).lower()
+                                        if any(x in fe_str for x in ["reply", "thread", "topic", "forum"]):
+                                            is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
+                                            next_reply = None
+                                            if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
+                                                next_reply = int(target_topic_anchor)
+                                            
+                                            logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={final_reply_target} ({fe}). Retrying with reply_to={next_reply}...")
+                                            try:
+                                                sent_msg = await userbot.send_message(
+                                                    entity=target_chat,
+                                                    message=msg_caption,
+                                                    file=local_file,
+                                                    reply_to=next_reply
+                                                )
+                                            except Exception as fe2:
+                                                if next_reply is not None:
+                                                    logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={next_reply} ({fe2}). Retrying with reply_to=None...")
+                                                    try:
+                                                        sent_msg = await userbot.send_message(
+                                                            entity=target_chat,
+                                                            message=msg_caption,
+                                                            file=local_file,
+                                                            reply_to=None
+                                                        )
+                                                    except Exception as fe3:
+                                                        raise fe3
+                                                else:
+                                                    raise fe2
+                                        else:
+                                            raise fe
                                     else:
                                         raise fe
                                 finally:
