@@ -1029,6 +1029,178 @@ class RapidAPIScraper:
         return unique_all_posts, current_cursor
 
 
+class ApifyScraper:
+    @staticmethod
+    def get_user_info(username, api_key, host=None):
+        username_clean = username.lstrip("@").strip()
+        url = f"https://api.apify.com/v2/actors/apify~instagram-scraper/run-sync-get-dataset-items?token={api_key}"
+        payload = {
+            "directUrls": [f"https://www.instagram.com/{username_clean}/"],
+            "resultsType": "details",
+            "resultsLimit": 1
+        }
+        headers = {
+            "Content-Type": "application/json"
+        }
+        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        if response.status_code not in [200, 201]:
+            raise RuntimeError(f"Apify request failed with status {response.status_code}: {response.text}")
+        
+        items = response.json()
+        if not items or not isinstance(items, list):
+            raise RuntimeError(f"Apify profile scraper returned no results or invalid format for {username_clean}")
+        
+        item = items[0]
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Invalid item type from Apify: {type(item)}")
+            
+        followers = int(item.get("followersCount") or 0)
+        following = int(item.get("followsCount") or item.get("followingCount") or 0)
+        posts_count = int(item.get("postsCount") or item.get("mediaCount") or 0)
+        
+        return {
+            "username": item.get("username") or username_clean,
+            "full_name": item.get("fullName") or "",
+            "biography": item.get("biography") or "",
+            "profile_pic_url": item.get("profilePicUrl") or "",
+            "followers_count": followers,
+            "following_count": following,
+            "posts_count": posts_count
+        }
+
+    @staticmethod
+    def get_latest_posts(username, api_key, host=None, cursor=None):
+        username_clean = username.lstrip("@").strip()
+        url = f"https://api.apify.com/v2/actors/apify~instagram-scraper/run-sync-get-dataset-items?token={api_key}"
+        payload = {
+            "directUrls": [f"https://www.instagram.com/{username_clean}/"],
+            "resultsType": "posts",
+            "resultsLimit": 100
+        }
+        headers = {
+            "Content-Type": "application/json"
+        }
+        response = requests.post(url, json=payload, headers=headers, timeout=300)
+        if response.status_code not in [200, 201]:
+            raise RuntimeError(f"Apify request failed with status {response.status_code}: {response.text}")
+        
+        items = response.json()
+        if not items or not isinstance(items, list):
+            return [], None
+            
+        posts = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+                
+            post_id = item.get("id") or item.get("shortCode")
+            if not post_id:
+                continue
+                
+            taken_at = int(time.time())
+            ts_str = item.get("timestamp")
+            if ts_str:
+                try:
+                    if ts_str.endswith("Z"):
+                        ts_str = ts_str.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(ts_str)
+                    taken_at = int(dt.timestamp())
+                except:
+                    pass
+            
+            caption = item.get("caption") or ""
+            likes = int(item.get("likesCount") or 0)
+            comments = int(item.get("commentsCount") or 0)
+            
+            item_type = str(item.get("type", "")).lower()
+            is_video = "video" in item_type or item.get("videoUrl") is not None
+            
+            carousel_children = item.get("carouselChildren")
+            if isinstance(carousel_children, list) and len(carousel_children) > 1 and not is_video:
+                for child in carousel_children:
+                    child_is_video = "video" in str(child.get("type", "")).lower() or child.get("videoUrl") is not None
+                    child_media_type = "video" if child_is_video else "image"
+                    child_url = child.get("videoUrl") if child_is_video else child.get("url")
+                    if not child_url:
+                        child_url = child.get("url") or child.get("displayUrl")
+                    if child_url:
+                        posts.append({
+                            "id": str(post_id),
+                            "media_url": child_url,
+                            "media_type": child_media_type,
+                            "caption": caption,
+                            "taken_at": taken_at,
+                            "likes_count": likes,
+                            "comments_count": comments
+                        })
+            else:
+                media_type = "video" if is_video else "image"
+                media_url = item.get("videoUrl") if is_video else item.get("displayUrl")
+                if not media_url:
+                    media_url = item.get("displayUrl") or item.get("url") or ""
+                if media_url:
+                    posts.append({
+                        "id": str(post_id),
+                        "media_url": media_url,
+                        "media_type": media_type,
+                        "caption": caption,
+                        "taken_at": taken_at,
+                        "likes_count": likes,
+                        "comments_count": comments
+                    })
+        return posts, None
+
+    @staticmethod
+    def get_latest_stories(username, api_key, host=None):
+        username_clean = username.lstrip("@").strip()
+        url = f"https://api.apify.com/v2/actors/apify~instagram-scraper/run-sync-get-dataset-items?token={api_key}"
+        payload = {
+            "directUrls": [f"https://www.instagram.com/{username_clean}/"],
+            "resultsType": "stories",
+            "resultsLimit": 20
+        }
+        headers = {
+            "Content-Type": "application/json"
+        }
+        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        if response.status_code not in [200, 201]:
+            return []
+        
+        items = response.json()
+        if not items or not isinstance(items, list):
+            return []
+            
+        stories = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            story_id = item.get("id")
+            taken_at = int(time.time())
+            ts_str = item.get("timestamp")
+            if ts_str:
+                try:
+                    if ts_str.endswith("Z"):
+                        ts_str = ts_str.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(ts_str)
+                    taken_at = int(dt.timestamp())
+                except:
+                    pass
+                    
+            is_video = item.get("videoUrl") is not None
+            media_url = item.get("videoUrl") if is_video else item.get("displayUrl")
+            if not media_url:
+                media_url = item.get("displayUrl") or item.get("url") or ""
+                
+            if story_id and media_url:
+                stories.append({
+                    "id": str(story_id),
+                    "media_url": media_url,
+                    "media_type": "video" if is_video else "image",
+                    "taken_at": taken_at
+                })
+        return stories
+
+
 # --- DYNAMIC KEY ROTATION EXECUTOR WRAPPER ---
 def execute_with_key_rotation(method_name, username, cursor=None):
     # Fetch all active keys sorted by requests_count ASC for load balancing
@@ -1050,7 +1222,11 @@ def execute_with_key_rotation(method_name, username, cursor=None):
         try:
             logger.info(f"Attempting {method_name} for @{username} using Key ID {kid} ({host})")
             
-            scraper_cls = RapidAPIScraper
+            if provider == "apify" or host == "apify" or "apify" in str(host).lower() or "apify" in str(provider).lower():
+                scraper_cls = ApifyScraper
+            else:
+                scraper_cls = RapidAPIScraper
+                
             api_method = getattr(scraper_cls, method_name)
             if method_name == "get_latest_posts":
                 result = api_method(username, api_key, host, cursor=cursor)
@@ -1289,11 +1465,14 @@ def get_instagram_api_keys_markup():
     markup = InlineKeyboardMarkup()
     
     markup.row(
-        InlineKeyboardButton("➕ Add API Key", callback_data="instagram_api_add"),
-        InlineKeyboardButton("🔄 Reset Exhausted Keys", callback_data="instagram_api_reset")
+        InlineKeyboardButton("➕ Add RapidAPI Key", callback_data="instagram_api_add_rapidapi"),
+        InlineKeyboardButton("➕ Add Apify Key", callback_data="instagram_api_add_apify")
     )
     markup.row(
-        InlineKeyboardButton("🗑️ Delete API Key", callback_data="instagram_api_delete_select"),
+        InlineKeyboardButton("🔄 Reset Exhausted Keys", callback_data="instagram_api_reset"),
+        InlineKeyboardButton("🗑️ Delete API Key", callback_data="instagram_api_delete_select")
+    )
+    markup.row(
         InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="instagram_main_menu")
     )
     return markup
@@ -2242,7 +2421,7 @@ def handle_instagram_callbacks(bot_instance, call):
             parse_mode="HTML"
         )
 
-    elif data == "instagram_api_add":
+    elif data == "instagram_api_add_rapidapi":
         bot_instance.answer_callback_query(call.id)
         user_states[user_id] = "WAITING_FOR_INSTAGRAM_API_KEY"
         
@@ -2253,12 +2432,30 @@ def handle_instagram_callbacks(bot_instance, call):
             
         bot_instance.send_message(
             chat_id,
-            "🔑 <b>Add New API Key</b>\n"
+            "🔑 <b>Add New RapidAPI Key</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Please send your RapidAPI key directly (defaults to <code>instagram-best-experience</code>).\n\n"
             "💡 <i>Advanced users: To use a custom endpoint provider, send the details in the format:</i>\n"
             "<code>KEY:PROVIDER_NAME:API_HOST_HEADER</code>\n"
             "<i>(Example: <code>xyz123abc:rocketapi:instagram-scraper-api2.p.rapidapi.com</code>)</i>\n\n"
+            "Send <code>/cancel</code> to abort.",
+            parse_mode="HTML"
+        )
+
+    elif data == "instagram_api_add_apify":
+        bot_instance.answer_callback_query(call.id)
+        user_states[user_id] = "WAITING_FOR_INSTAGRAM_APIFY_KEY"
+        
+        try:
+            bot_instance.delete_message(chat_id, call.message.message_id)
+        except:
+            pass
+            
+        bot_instance.send_message(
+            chat_id,
+            "🔑 <b>Add New Apify API Key</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send your Apify API Token directly (from your Apify Console under Integrations).\n\n"
             "Send <code>/cancel</code> to abort.",
             parse_mode="HTML"
         )
@@ -2775,6 +2972,36 @@ def handle_instagram_inputs(bot_instance, message):
                 commit=True
             )
             bot_instance.reply_to(message, "✅ <b>New API Key added successfully!</b>", parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Error adding duplicate key: {e}")
+            bot_instance.reply_to(message, "⚠️ This API Key is already registered or invalid.", parse_mode="HTML")
+            
+        class CallMock:
+            def __init__(self, from_user, message, cid):
+                self.from_user = from_user
+                self.message = message
+                self.data = cid
+                self.id = "0"
+        handle_instagram_callbacks(bot_instance, CallMock(message.from_user, message, "instagram_api_menu"))
+        return True
+
+    elif state == "WAITING_FOR_INSTAGRAM_APIFY_KEY":
+        user_states[user_id] = None
+        api_key = text.strip()
+        provider = "apify"
+        host = "apify.com"
+        
+        if not api_key:
+            bot_instance.reply_to(message, "❌ Invalid input. Setting Apify API Key aborted.")
+            return True
+            
+        try:
+            db_client.execute_query(
+                "INSERT INTO instagram_api_keys (api_key, provider, host) VALUES (%s, %s, %s)",
+                (api_key, provider, host),
+                commit=True
+            )
+            bot_instance.reply_to(message, "✅ <b>New Apify API Key added successfully!</b>", parse_mode="HTML")
         except Exception as e:
             logger.warning(f"Error adding duplicate key: {e}")
             bot_instance.reply_to(message, "⚠️ This API Key is already registered or invalid.", parse_mode="HTML")
