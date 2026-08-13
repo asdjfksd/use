@@ -1640,6 +1640,27 @@ def handle_instagram_callbacks(bot_instance, call):
             pass
             
         if pic_url:
+            lf = download_media_temp(pic_url)
+            if lf:
+                try:
+                    with open(lf, 'rb') as f:
+                        bot_instance.send_photo(
+                            chat_id,
+                            f,
+                            caption=caption,
+                            reply_markup=get_instagram_profile_markup(target_id, ia_stories_active, ia_interval, ia_posts_active, ia_post_interval),
+                            parse_mode="HTML"
+                        )
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed to send local profile photo file: {e}")
+                finally:
+                    try:
+                        os.remove(lf)
+                    except:
+                        pass
+            
+            # Fallback to direct URL if local download failed or sending failed
             try:
                 bot_instance.send_photo(
                     chat_id,
@@ -2030,20 +2051,39 @@ def handle_instagram_callbacks(bot_instance, call):
                 
                 caption = f"⚡ <b>Story {idx+1}/{len(stories)} by @{username}</b>\n🕒 Uploaded: <i>{taken_str}</i>"
                 
-                try:
-                    if s_type == "video":
-                        bot_instance.send_video(chat_id, s_url, caption=caption, parse_mode="HTML")
-                    else:
-                        bot_instance.send_photo(chat_id, s_url, caption=caption, parse_mode="HTML")
-                except Exception as e:
-                    logger.warning(f"Story Direct upload failed: {e}. Sending fallback link.")
-                    bot_instance.send_message(
-                        chat_id,
-                        f"⚡ <b>Story {idx+1}/{len(stories)} by @{username}</b>\n"
-                        f"🕒 Uploaded: <i>{taken_str}</i>\n\n"
-                        f"🔗 <a href='{s_url}'>Direct Media Link ({s_type.upper()})</a>",
-                        parse_mode="HTML"
-                    )
+                sent = False
+                lf = download_media_temp(s_url)
+                if lf:
+                    try:
+                        with open(lf, 'rb') as f:
+                            if s_type == "video":
+                                bot_instance.send_video(chat_id, f, caption=caption, parse_mode="HTML")
+                            else:
+                                bot_instance.send_photo(chat_id, f, caption=caption, parse_mode="HTML")
+                        sent = True
+                    except Exception as e:
+                        logger.warning(f"Failed to send local story file: {e}")
+                    finally:
+                        try:
+                            os.remove(lf)
+                        except:
+                            pass
+                
+                if not sent:
+                    try:
+                        if s_type == "video":
+                            bot_instance.send_video(chat_id, s_url, caption=caption, parse_mode="HTML")
+                        else:
+                            bot_instance.send_photo(chat_id, s_url, caption=caption, parse_mode="HTML")
+                    except Exception as e:
+                        logger.warning(f"Story Direct upload failed: {e}. Sending fallback link.")
+                        bot_instance.send_message(
+                            chat_id,
+                            f"⚡ <b>Story {idx+1}/{len(stories)} by @{username}</b>\n"
+                            f"🕒 Uploaded: <i>{taken_str}</i>\n\n"
+                            f"🔗 <a href='{s_url}'>Direct Media Link ({s_type.upper()})</a>",
+                            parse_mode="HTML"
+                        )
                     
         except Exception as e:
             logger.error(f"Error checking stories: {e}")
@@ -2250,6 +2290,19 @@ def handle_instagram_callbacks(bot_instance, call):
             pass
             
         if pic_url:
+            lf = download_media_temp(pic_url)
+            if lf:
+                try:
+                    with open(lf, 'rb') as f:
+                        bot_instance.send_photo(chat_id, f, caption=caption, reply_markup=markup, parse_mode="HTML")
+                    return
+                except:
+                    pass
+                finally:
+                    try:
+                        os.remove(lf)
+                    except:
+                        pass
             try:
                 bot_instance.send_photo(chat_id, pic_url, caption=caption, reply_markup=markup, parse_mode="HTML")
                 return
@@ -2585,32 +2638,58 @@ def send_search_posts_page(bot_instance, chat_id, username, offset=0, client_typ
         # RULE 1: Carousel / Sidecar (more than 1 media) -> Send as separate dedicated album with caption
         if len(media_list) > 1:
             album = []
+            opened_files = []
             for idx, (m_url, m_type) in enumerate(media_list):
                 item_cap = caption_full if idx == 0 else ""
+                if client_type != "pyrogram":
+                    lf = download_media_temp(m_url)
+                    if lf:
+                        try:
+                            f_obj = open(lf, 'rb')
+                            opened_files.append((f_obj, lf))
+                            media_val = f_obj
+                        except:
+                            media_val = m_url
+                    else:
+                        media_val = m_url
+                else:
+                    media_val = m_url
+
                 if client_type == "pyrogram":
                     from pyrogram.types import InputMediaPhoto as PyPhoto, InputMediaVideo as PyVideo
                     if m_type == "video":
-                        album.append(PyVideo(m_url, caption=item_cap, parse_mode="HTML"))
+                        album.append(PyVideo(media_val, caption=item_cap, parse_mode="HTML"))
                     else:
-                        album.append(PyPhoto(m_url, caption=item_cap, parse_mode="HTML"))
+                        album.append(PyPhoto(media_val, caption=item_cap, parse_mode="HTML"))
                 else:
                     from telebot.types import InputMediaPhoto, InputMediaVideo
                     if m_type == "video":
-                        album.append(InputMediaVideo(m_url, caption=item_cap, parse_mode="HTML"))
+                        album.append(InputMediaVideo(media_val, caption=item_cap, parse_mode="HTML"))
                     else:
-                        album.append(InputMediaPhoto(m_url, caption=item_cap, parse_mode="HTML"))
+                        album.append(InputMediaPhoto(media_val, caption=item_cap, parse_mode="HTML"))
             
             # Send separate Carousel album
-            if client_type == "pyrogram":
-                async def send_py_album(grp):
-                    await bot_instance.send_media_group(chat_id=chat_id, media=grp)
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.run_coroutine_threadsafe(send_py_album(album), loop).result()
+            try:
+                if client_type == "pyrogram":
+                    async def send_py_album(grp):
+                        await bot_instance.send_media_group(chat_id=chat_id, media=grp)
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.run_coroutine_threadsafe(send_py_album(album), loop).result()
+                    else:
+                        loop.run_until_complete(send_py_album(album))
                 else:
-                    loop.run_until_complete(send_py_album(album))
-            else:
-                bot_instance.send_media_group(chat_id=chat_id, media=album)
+                    bot_instance.send_media_group(chat_id=chat_id, media=album)
+            finally:
+                for f_obj, lf in opened_files:
+                    try:
+                        f_obj.close()
+                    except:
+                        pass
+                    try:
+                        os.remove(lf)
+                    except:
+                        pass
             time.sleep(1)
                 
         # RULE 2: Reel (exactly 1 video) -> Send separately with caption
@@ -2625,7 +2704,18 @@ def send_search_posts_page(bot_instance, chat_id, username, offset=0, client_typ
                 else:
                     loop.run_until_complete(send_py_video())
             else:
-                bot_instance.send_video(chat_id=chat_id, video=v_url, caption=caption_full, parse_mode="HTML")
+                lf = download_media_temp(v_url)
+                if lf:
+                    try:
+                        with open(lf, 'rb') as f:
+                            bot_instance.send_video(chat_id=chat_id, video=f, caption=caption_full, parse_mode="HTML")
+                    finally:
+                        try:
+                            os.remove(lf)
+                        except:
+                            pass
+                else:
+                    bot_instance.send_video(chat_id=chat_id, video=v_url, caption=caption_full, parse_mode="HTML")
             time.sleep(1)
                 
         # RULE 3: Single Photo -> Send separately with caption
@@ -2640,7 +2730,18 @@ def send_search_posts_page(bot_instance, chat_id, username, offset=0, client_typ
                 else:
                     loop.run_until_complete(send_py_photo())
             else:
-                bot_instance.send_photo(chat_id=chat_id, photo=img_url, caption=caption_full, parse_mode="HTML")
+                lf = download_media_temp(img_url)
+                if lf:
+                    try:
+                        with open(lf, 'rb') as f:
+                            bot_instance.send_photo(chat_id=chat_id, photo=f, caption=caption_full, parse_mode="HTML")
+                    finally:
+                        try:
+                            os.remove(lf)
+                        except:
+                            pass
+                else:
+                    bot_instance.send_photo(chat_id=chat_id, photo=img_url, caption=caption_full, parse_mode="HTML")
             time.sleep(1)
         
     # 3. Send Companion message with pagination keyboard if there's more
@@ -2874,10 +2975,27 @@ def handle_instagram_inputs(bot_instance, message):
             
             pic_url = profile.get("profile_pic_url")
             if pic_url:
-                try:
-                    bot_instance.send_photo(chat_id, pic_url, caption=caption, parse_mode="HTML")
-                except Exception:
-                    bot_instance.send_message(chat_id, f"🖼️ <a href='{pic_url}'>Profile Photo</a>\n\n{caption}", parse_mode="HTML", disable_web_page_preview=True)
+                lf = download_media_temp(pic_url)
+                if lf:
+                    try:
+                        with open(lf, 'rb') as f:
+                            bot_instance.send_photo(chat_id, f, caption=caption, parse_mode="HTML")
+                        lf = None # avoid duplicate attempts
+                    except Exception:
+                        pass
+                    finally:
+                        if lf:
+                            try:
+                                os.remove(lf)
+                            except:
+                                pass
+                if not lf:
+                    pass
+                else:
+                    try:
+                        bot_instance.send_photo(chat_id, pic_url, caption=caption, parse_mode="HTML")
+                    except Exception:
+                        bot_instance.send_message(chat_id, f"🖼️ <a href='{pic_url}'>Profile Photo</a>\n\n{caption}", parse_mode="HTML", disable_web_page_preview=True)
             else:
                 bot_instance.send_message(chat_id, caption, parse_mode="HTML")
                 
@@ -3081,10 +3199,27 @@ def handle_direct_insta_command(tg_bot, msg):
         
         pic_url = profile.get("profile_pic_url")
         if pic_url:
-            try:
-                tg_bot.send_photo(msg.chat.id, pic_url, caption=caption, parse_mode="HTML")
-            except Exception:
-                tg_bot.send_message(msg.chat.id, f"🖼️ <a href='{pic_url}'>Profile Photo</a>\n\n{caption}", parse_mode="HTML", disable_web_page_preview=True)
+            lf = download_media_temp(pic_url)
+            if lf:
+                try:
+                    with open(lf, 'rb') as f:
+                        tg_bot.send_photo(msg.chat.id, f, caption=caption, parse_mode="HTML")
+                    lf = None
+                except Exception:
+                    pass
+                finally:
+                    if lf:
+                        try:
+                            os.remove(lf)
+                        except:
+                            pass
+            if not lf:
+                pass
+            else:
+                try:
+                    tg_bot.send_photo(msg.chat.id, pic_url, caption=caption, parse_mode="HTML")
+                except Exception:
+                    tg_bot.send_message(msg.chat.id, f"🖼️ <a href='{pic_url}'>Profile Photo</a>\n\n{caption}", parse_mode="HTML", disable_web_page_preview=True)
         else:
             tg_bot.send_message(msg.chat.id, caption, parse_mode="HTML")
             
