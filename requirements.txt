@@ -5,4 +5,11 @@ python-dotenv==1.1.0
 telebot
 flask
 telethon
-psycopg2
+pyTelegramBotAPI
+pyrogram
+tgcrypto
+python-dotenv
+flask
+psycopg2-binary
+requests
+instaloader
