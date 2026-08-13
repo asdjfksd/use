@@ -739,17 +739,17 @@ class RapidAPIScraper:
             if "instagram-best-experience" in host:
                 url = f"https://{host}/feed?user_id={user_id}"
                 if current_cursor:
-                    url += f"&max_id={current_cursor}"
+                    url += f"&max_id={current_cursor}&cursor={current_cursor}"
                 response = requests.get(url, headers=cls._headers(api_key, host), timeout=25)
             elif is_get_api:
                 url_args = f"username_or_id_or_url={username_clean}&count=100&limit=100"
                 if current_cursor:
-                    url_args += f"&cursor={current_cursor}&max_id={current_cursor}"
+                    url_args += f"&cursor={current_cursor}&max_id={current_cursor}&next_max_id={current_cursor}&pagination_token={current_cursor}"
                 url = f"https://{host}/v1/posts?{url_args}"
                 if "data12" in host:
                     url = f"https://{host}/user/posts?username={username_clean}&count=100&limit=100"
                     if current_cursor:
-                        url += f"&cursor={current_cursor}"
+                        url += f"&cursor={current_cursor}&max_id={current_cursor}"
                 response = requests.get(url, headers=cls._headers(api_key, host), timeout=25)
             else:
                 url = f"https://{host}/api/instagram/posts"
@@ -757,6 +757,8 @@ class RapidAPIScraper:
                 if current_cursor:
                     payload["cursor"] = current_cursor
                     payload["max_id"] = current_cursor
+                    payload["next_max_id"] = current_cursor
+                    payload["pagination_token"] = current_cursor
                 response = requests.post(url, headers=cls._headers(api_key, host), json=payload, timeout=25)
                 
             if response.status_code != 200:
@@ -994,13 +996,22 @@ class RapidAPIScraper:
             # Parse next cursor dynamically
             next_c = None
             if isinstance(result, dict):
-                next_c = result.get("next_max_id") or result.get("next_cursor") or result.get("cursor")
+                next_c = result.get("next_max_id") or result.get("next_cursor") or result.get("cursor") or result.get("next_page_token")
                 if not next_c and isinstance(result.get("page_info"), dict):
                     page_info = result["page_info"]
                     if page_info.get("has_next_page"):
                         next_c = page_info.get("end_cursor")
+                if not next_c and isinstance(result.get("pagination"), dict):
+                    pagination = result["pagination"]
+                    next_c = pagination.get("next_max_id") or pagination.get("next_cursor") or pagination.get("cursor")
             if not next_c and isinstance(res_json, dict):
-                next_c = res_json.get("next_max_id") or res_json.get("next_cursor")
+                next_c = res_json.get("next_max_id") or res_json.get("next_cursor") or res_json.get("cursor") or res_json.get("next_page_token")
+                if not next_c and isinstance(res_json.get("page_info"), dict):
+                    page_info = res_json["page_info"]
+                    next_c = page_info.get("end_cursor") or page_info.get("next_max_id")
+                if not next_c and isinstance(res_json.get("pagination"), dict):
+                    pagination = res_json["pagination"]
+                    next_c = pagination.get("next_max_id") or pagination.get("next_cursor") or pagination.get("cursor")
                 
             current_cursor = next_c
             
@@ -2356,8 +2367,6 @@ def send_search_posts_page(bot_instance, chat_id, username, offset=0, client_typ
             post_metadata[pid] = (cap, likes, comments, taken)
             
     # Process and deliver
-    single_photos_list = []
-    
     # Preserve chronological parent order when iterating
     for pid in post_ids:
         media_list = media_by_post[pid]
@@ -2405,6 +2414,7 @@ def send_search_posts_page(bot_instance, chat_id, username, offset=0, client_typ
                     loop.run_until_complete(send_py_album(album))
             else:
                 bot_instance.send_media_group(chat_id=chat_id, media=album)
+            time.sleep(1)
                 
         # RULE 2: Reel (exactly 1 video) -> Send separately with caption
         elif len(media_list) == 1 and media_list[0][1] == "video":
@@ -2419,34 +2429,22 @@ def send_search_posts_page(bot_instance, chat_id, username, offset=0, client_typ
                     loop.run_until_complete(send_py_video())
             else:
                 bot_instance.send_video(chat_id=chat_id, video=v_url, caption=caption_full, parse_mode="HTML")
+            time.sleep(1)
                 
-        # RULE 3: Single Photo -> Collect to group them together later with NO caption
+        # RULE 3: Single Photo -> Send separately with caption
         elif len(media_list) == 1 and media_list[0][1] == "image":
-            single_photos_list.append(media_list[0][0])
-            
-    # Deliver grouped single photos at the end of the page (max 10 per album, NO captions)
-    if single_photos_list:
-        for i in range(0, len(single_photos_list), 10):
-            chunk = single_photos_list[i:i+10]
-            album = []
-            for m_url in chunk:
-                if client_type == "pyrogram":
-                    from pyrogram.types import InputMediaPhoto as PyPhoto
-                    album.append(PyPhoto(m_url))
-                else:
-                    from telebot.types import InputMediaPhoto
-                    album.append(InputMediaPhoto(m_url))
-                    
+            img_url = media_list[0][0]
             if client_type == "pyrogram":
-                async def send_py_album(grp):
-                    await bot_instance.send_media_group(chat_id=chat_id, media=grp)
+                async def send_py_photo():
+                    await bot_instance.send_photo(chat_id=chat_id, photo=img_url, caption=caption_full, parse_mode="HTML")
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    asyncio.run_coroutine_threadsafe(send_py_album(album), loop).result()
+                    asyncio.run_coroutine_threadsafe(send_py_photo(), loop).result()
                 else:
-                    loop.run_until_complete(send_py_album(album))
+                    loop.run_until_complete(send_py_photo())
             else:
-                bot_instance.send_media_group(chat_id=chat_id, media=album)
+                bot_instance.send_photo(chat_id=chat_id, photo=img_url, caption=caption_full, parse_mode="HTML")
+            time.sleep(1)
         
     # 3. Send Companion message with pagination keyboard if there's more
     cursor = get_instagram_setting(f"cursor_{username.lower()}")
@@ -3472,8 +3470,6 @@ async def async_send_search_posts_page_telethon(client, chat_id, username, offse
         if pid not in post_metadata:
             post_metadata[pid] = (cap, likes, comments, taken)
             
-    single_photos_list = []
-    
     for pid in post_ids:
         media_list = media_by_post[pid]
         if not media_list:
@@ -3506,6 +3502,7 @@ async def async_send_search_posts_page_telethon(client, chat_id, username, offse
                             os.remove(lf)
                         except:
                             pass
+            await asyncio.sleep(1)
         elif len(media_list) == 1 and media_list[0][1] == "video":
             lf = await loop.run_in_executor(None, download_media_temp, media_list[0][0])
             if lf:
@@ -3516,27 +3513,18 @@ async def async_send_search_posts_page_telethon(client, chat_id, username, offse
                         os.remove(lf)
                     except:
                         pass
+            await asyncio.sleep(1)
         elif len(media_list) == 1 and media_list[0][1] == "image":
-            single_photos_list.append(media_list[0][0])
-            
-    if single_photos_list:
-        loop = asyncio.get_event_loop()
-        for i in range(0, len(single_photos_list), 10):
-            chunk = single_photos_list[i:i+10]
-            local_files = []
-            for url in chunk:
-                lf = await loop.run_in_executor(None, download_media_temp, url)
-                if lf:
-                    local_files.append(lf)
-            if local_files:
+            lf = await loop.run_in_executor(None, download_media_temp, media_list[0][0])
+            if lf:
                 try:
-                    await client.send_file(chat_id, local_files)
+                    await client.send_file(chat_id, lf, caption=caption_full, parse_mode="HTML")
                 finally:
-                    for lf in local_files:
-                        try:
-                            os.remove(lf)
-                        except:
-                            pass
+                    try:
+                        os.remove(lf)
+                    except:
+                        pass
+            await asyncio.sleep(1)
             
     cursor = get_instagram_setting(f"cursor_{username.lower()}")
     has_more_cached = (offset + 10 < total_cached)
