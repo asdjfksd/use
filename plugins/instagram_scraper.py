@@ -1230,6 +1230,11 @@ class ApifyScraper:
                 logger.info("ApifyScraper: skipping highlight story")
                 continue
                 
+            # Filter out post objects (if scraper fell back or returned posts)
+            if "shortcode" in item or "likesCount" in item or "commentsCount" in item:
+                logger.info("ApifyScraper: skipping post item (has post fields)")
+                continue
+                
             story_id = item.get("id")
             taken_at = int(time.time())
             ts_str = item.get("timestamp")
