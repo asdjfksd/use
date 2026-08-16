@@ -576,8 +576,21 @@ class HikerAPIScraper:
     @classmethod
     def get_latest_stories(cls, username, api_key, host=None):
         username_clean = username.lstrip("@").strip()
-        url = f"https://api.hikerapi.com/v2/user/stories/by/username?username={username_clean}"
-        response = requests.get(url, headers=cls._headers(api_key), timeout=25)
+        
+        # 1. Resolve user ID first to ensure stories fetch is reliable
+        try:
+            info = cls.get_user_info(username_clean, api_key)
+            user_id = info["id"]
+        except Exception as e:
+            logger.error(f"HikerAPIScraper: failed to resolve user ID for {username_clean}: {e}")
+            set_instagram_setting("last_stories_debug", f"HikerAPI: Failed to resolve user ID: {e}")
+            return []
+            
+        # 2. Query stories by user ID using v1/user/stories
+        url = f"https://api.hikerapi.com/v1/user/stories"
+        params = {"user_id": user_id}
+        response = requests.get(url, params=params, headers=cls._headers(api_key), timeout=25)
+        
         if response.status_code == 404:
             set_instagram_setting("last_stories_debug", "HikerAPI: 404 Not Found (user has no active stories)")
             return []
