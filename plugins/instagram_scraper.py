@@ -484,6 +484,22 @@ def find_cursor_in_dict(d, depth=0):
 
 class HikerAPIScraper:
     @staticmethod
+    def parse_timestamp(val):
+        if not val:
+            return int(time.time())
+        try:
+            return int(float(val))
+        except (ValueError, TypeError):
+            try:
+                from datetime import datetime
+                clean_val = str(val).replace("Z", "+00:00")
+                dt = datetime.fromisoformat(clean_val)
+                return int(dt.timestamp())
+            except Exception as e:
+                logger.warning(f"Failed parsing HikerAPI timestamp {val}: {e}")
+                return int(time.time())
+
+    @staticmethod
     def _headers(api_key):
         return {
             "x-access-key": api_key,
@@ -542,7 +558,7 @@ class HikerAPIScraper:
             caption = caption_dict.get("text", "") if isinstance(caption_dict, dict) else str(caption_dict)
             likes = item.get("like_count", 0)
             comments = item.get("comment_count", 0)
-            taken_at = item.get("taken_at") or int(time.time())
+            taken_at = cls.parse_timestamp(item.get("taken_at"))
             
             media_url = ""
             media_type = "image"
@@ -567,7 +583,7 @@ class HikerAPIScraper:
                     "media_url": media_url,
                     "media_type": media_type,
                     "caption": caption,
-                    "taken_at": int(taken_at),
+                    "taken_at": taken_at,
                     "likes_count": int(likes),
                     "comments_count": int(comments)
                 })
@@ -617,7 +633,7 @@ class HikerAPIScraper:
             if not isinstance(item, dict):
                 continue
             story_id = item.get("id") or item.get("pk")
-            taken_at = item.get("taken_at") or int(time.time())
+            taken_at = cls.parse_timestamp(item.get("taken_at"))
             
             media_url = ""
             media_type = "image"
@@ -642,7 +658,7 @@ class HikerAPIScraper:
                     "id": str(story_id),
                     "media_url": media_url,
                     "media_type": media_type,
-                    "taken_at": int(taken_at)
+                    "taken_at": taken_at
                 })
         return stories
 
