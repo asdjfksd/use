@@ -708,6 +708,13 @@ class RapidAPIScraper:
                 elif isinstance(res_json.get("stories"), list):
                     items = res_json["stories"]
                 
+        if not items:
+            set_instagram_setting("last_stories_debug", f"RapidAPI: No items found in response (status {response.status_code})")
+        else:
+            sample = items[0] if len(items) > 0 else {}
+            sample_keys = list(sample.keys()) if isinstance(sample, dict) else []
+            set_instagram_setting("last_stories_debug", f"RapidAPI: Fetched {len(items)} items. Sample keys: {sample_keys}")
+            
         stories = []
         for item in items:
             story_id = item.get("id") or item.get("pk")
@@ -1204,12 +1211,20 @@ class ApifyScraper:
         response = requests.post(url, json=payload, headers=headers, timeout=120)
         if response.status_code not in [200, 201]:
             logger.error(f"ApifyScraper: stories request failed with status {response.status_code}")
+            set_instagram_setting("last_stories_debug", f"Apify: Request failed with status {response.status_code}")
             return []
         
         items = response.json()
-        if not items or not isinstance(items, list):
-            logger.info("ApifyScraper: no items or invalid list returned for stories")
+        if not items:
+            set_instagram_setting("last_stories_debug", "Apify: Response was empty")
             return []
+        elif not isinstance(items, list):
+            set_instagram_setting("last_stories_debug", f"Apify: Response not list: {str(items)[:150]}")
+            return []
+        else:
+            sample = items[0] if len(items) > 0 else {}
+            sample_keys = list(sample.keys()) if isinstance(sample, dict) else []
+            set_instagram_setting("last_stories_debug", f"Apify: Fetched {len(items)} items. Sample keys: {sample_keys}")
             
         stories = []
         for item in items:
@@ -2103,7 +2118,13 @@ def handle_instagram_callbacks(bot_instance, call):
                 pass
                 
             if not stories:
-                bot_instance.send_message(chat_id, f"ℹ️ <b>No active stories</b> found for @{username} in the last 24h.", parse_mode="HTML")
+                debug_info = get_instagram_setting("last_stories_debug", "No debug info recorded")
+                bot_instance.send_message(
+                    chat_id, 
+                    f"ℹ️ <b>No active stories</b> found for @{username} in the last 24h.\n\n"
+                    f"🔬 <b>Debug Details:</b>\n<code>{debug_info}</code>", 
+                    parse_mode="HTML"
+                )
                 return
                 
             bot_instance.send_message(chat_id, f"⚡ <b>Found {len(stories)} active stories for @{username}:</b>", parse_mode="HTML")
