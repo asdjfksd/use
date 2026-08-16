@@ -1183,26 +1183,48 @@ class ApifyScraper:
     def get_latest_stories(username, api_key, host=None):
         username_clean = username.lstrip("@").strip()
         url = f"https://api.apify.com/v2/actors/apify~instagram-scraper/run-sync-get-dataset-items?token={api_key}"
+        
         payload = {
             "directUrls": [f"https://www.instagram.com/{username_clean}/"],
             "resultsType": "stories",
             "resultsLimit": 20
         }
+        
+        # Load sessionCookie if stored in settings
+        cookie = get_instagram_setting("apify_session_cookie", "").strip()
+        if cookie:
+            payload["sessionCookie"] = cookie
+            
         headers = {
             "Content-Type": "application/json"
         }
+        
+        logger.info(f"ApifyScraper: requesting stories for @{username_clean} (cookie configured: {bool(cookie)})")
+        
         response = requests.post(url, json=payload, headers=headers, timeout=120)
         if response.status_code not in [200, 201]:
+            logger.error(f"ApifyScraper: stories request failed with status {response.status_code}")
             return []
         
         items = response.json()
         if not items or not isinstance(items, list):
+            logger.info("ApifyScraper: no items or invalid list returned for stories")
             return []
             
         stories = []
         for item in items:
             if not isinstance(item, dict):
                 continue
+                
+            # Filter out non-story items (e.g. user details or profile metadata)
+            item_type = str(item.get("type", "")).lower()
+            if item_type in ["user", "profile", "comment", "post"]:
+                logger.info(f"ApifyScraper: skipping non-story item of type '{item_type}'")
+                continue
+            if "biography" in item or "followersCount" in item or "followsCount" in item:
+                logger.info("ApifyScraper: skipping user profile object")
+                continue
+                
             story_id = item.get("id")
             taken_at = int(time.time())
             ts_str = item.get("timestamp")
@@ -1227,6 +1249,7 @@ class ApifyScraper:
                     "media_type": "video" if is_video else "image",
                     "taken_at": taken_at
                 })
+        logger.info(f"ApifyScraper: successfully parsed {len(stories)} stories for @{username_clean}")
         return stories
 
 
@@ -1496,6 +1519,10 @@ def get_instagram_api_keys_markup():
     markup.row(
         InlineKeyboardButton("➕ Add RapidAPI Key", callback_data="instagram_api_add_rapidapi"),
         InlineKeyboardButton("➕ Add Apify Key", callback_data="instagram_api_add_apify")
+    )
+    markup.row(
+        InlineKeyboardButton("🍪 Set Apify Session Cookie", callback_data="instagram_api_add_apify_cookie"),
+        InlineKeyboardButton("🗑️ Clear Apify Cookie", callback_data="instagram_api_clear_apify_cookie")
     )
     markup.row(
         InlineKeyboardButton("🔄 Reset Exhausted Keys", callback_data="instagram_api_reset"),
@@ -2491,6 +2518,14 @@ def handle_instagram_callbacks(bot_instance, call):
                     f"   └ <b>Requests Used</b>: <code>{count}</code>\n\n"
                 )
                 
+        # Show active Apify Session Cookie
+        cookie = get_instagram_setting("apify_session_cookie", "").strip()
+        if cookie:
+            masked_cookie = cookie[:8] + "..." + cookie[-8:] if len(cookie) > 16 else "..."
+            menu_text += f"🍪 <b>Apify Session Cookie:</b> <code>{masked_cookie}</code>\n\n"
+        else:
+            menu_text += "🍪 <b>Apify Session Cookie:</b> <i>Not configured (required for Apify stories scraping)</i>\n\n"
+            
         try:
             bot_instance.delete_message(chat_id, call.message.message_id)
         except:
@@ -2541,6 +2576,38 @@ def handle_instagram_callbacks(bot_instance, call):
             "Send <code>/cancel</code> to abort.",
             parse_mode="HTML"
         )
+
+    elif data == "instagram_api_add_apify_cookie":
+        bot_instance.answer_callback_query(call.id)
+        user_states[user_id] = "WAITING_FOR_INSTAGRAM_APIFY_COOKIE"
+        
+        try:
+            bot_instance.delete_message(chat_id, call.message.message_id)
+        except:
+            pass
+            
+        bot_instance.send_message(
+            chat_id,
+            "🍪 <b>Set Apify Session Cookie</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "To scrape Instagram Stories and Highlights using Apify, Instagram requires a logged-in session.\n\n"
+            "Please copy your Instagram <code>sessionid</code> cookie from your browser and paste it here.\n"
+            "<i>(Example: <code>sessionid=5819203810%3Aabcd...</code>)</i>\n\n"
+            "Send <code>/cancel</code> to abort.",
+            parse_mode="HTML"
+        )
+
+    elif data == "instagram_api_clear_apify_cookie":
+        db_client.execute_query("DELETE FROM instagram_settings WHERE key = 'apify_session_cookie'", commit=True)
+        bot_instance.answer_callback_query(call.id, "🍪 Apify Session Cookie cleared!", show_alert=True)
+        
+        class CallMock:
+            def __init__(self, from_user, message, cid):
+                self.from_user = from_user
+                self.message = message
+                self.data = cid
+                self.id = "0"
+        handle_instagram_callbacks(bot_instance, CallMock(call.from_user, call.message, "instagram_api_menu"))
 
     elif data == "instagram_api_reset":
         db_client.execute_query("UPDATE instagram_api_keys SET active = 1", commit=True)
@@ -3184,6 +3251,27 @@ def handle_instagram_inputs(bot_instance, message):
             logger.warning(f"Error adding duplicate key: {e}")
             bot_instance.reply_to(message, "⚠️ This API Key is already registered or invalid.", parse_mode="HTML")
             
+        class CallMock:
+            def __init__(self, from_user, message, cid):
+                self.from_user = from_user
+                self.message = message
+                self.data = cid
+                self.id = "0"
+        handle_instagram_callbacks(bot_instance, CallMock(message.from_user, message, "instagram_api_menu"))
+        return True
+
+    elif state == "WAITING_FOR_INSTAGRAM_APIFY_COOKIE":
+        user_states[user_id] = None
+        raw_cookie = text.strip()
+        clean_cookie = raw_cookie.strip("'\" \t\r\n")
+        
+        if not clean_cookie:
+            bot_instance.reply_to(message, "❌ Invalid input. Setting Apify Session Cookie aborted.")
+            return True
+            
+        set_instagram_setting("apify_session_cookie", clean_cookie)
+        bot_instance.reply_to(message, "✅ <b>Apify Session Cookie configured successfully!</b>", parse_mode="HTML")
+        
         class CallMock:
             def __init__(self, from_user, message, cid):
                 self.from_user = from_user
