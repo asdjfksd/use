@@ -1225,6 +1225,11 @@ class ApifyScraper:
                 logger.info("ApifyScraper: skipping user profile object")
                 continue
                 
+            # Filter out permanent story highlights
+            if item.get("isHighlight") or item.get("highlightId") or item.get("highlightTitle"):
+                logger.info("ApifyScraper: skipping highlight story")
+                continue
+                
             story_id = item.get("id")
             taken_at = int(time.time())
             ts_str = item.get("timestamp")
