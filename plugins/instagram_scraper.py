@@ -1467,7 +1467,7 @@ def execute_with_key_rotation(method_name, username, cursor=None):
             
             # Detect Rate Limits or Quota exhaustion
             is_exhausted = False
-            if any(x in err_str or x in err_str.lower() for x in ["429", "403", "limit", "exceeded", "forbidden"]):
+            if any(x in err_str or x in err_str.lower() for x in ["429", "403", "402", "limit", "exceeded", "forbidden", "payment"]):
                 is_exhausted = True
                 
             if is_exhausted:
