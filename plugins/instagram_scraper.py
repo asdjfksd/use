@@ -579,8 +579,10 @@ class HikerAPIScraper:
         url = f"https://api.hikerapi.com/v2/user/stories/by/username?username={username_clean}"
         response = requests.get(url, headers=cls._headers(api_key), timeout=25)
         if response.status_code == 404:
+            set_instagram_setting("last_stories_debug", "HikerAPI: 404 Not Found (user has no active stories)")
             return []
         if response.status_code != 200:
+            set_instagram_setting("last_stories_debug", f"HikerAPI: Request failed with status {response.status_code}")
             raise RuntimeError(f"HikerAPI stories failed: Status {response.status_code}")
             
         res_json = response.json()
@@ -589,6 +591,13 @@ class HikerAPIScraper:
             items = res_json
         elif isinstance(res_json, dict):
             items = res_json.get("items", []) or res_json.get("stories", [])
+            
+        if not items:
+            set_instagram_setting("last_stories_debug", "HikerAPI: Response items list was empty")
+        else:
+            sample = items[0] if len(items) > 0 else {}
+            sample_keys = list(sample.keys()) if isinstance(sample, dict) else []
+            set_instagram_setting("last_stories_debug", f"HikerAPI: Fetched {len(items)} items. Sample keys: {sample_keys}")
             
         stories = []
         for item in items:
