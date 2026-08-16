@@ -1235,10 +1235,11 @@ class ApifyScraper:
                 logger.info("ApifyScraper: skipping post item (has post fields)")
                 continue
                 
-            story_id = item.get("id")
-            taken_at = int(time.time())
-            ts_str = item.get("timestamp")
-            if ts_str:
+            story_id = item.get("id") or item.get("storyId") or item.get("pk")
+            taken_at = item.get("taken_at") or item.get("taken_at_timestamp") or int(time.time())
+            
+            ts_str = item.get("timestamp") or item.get("postedAt") or item.get("taken_at")
+            if ts_str and isinstance(ts_str, str):
                 try:
                     if ts_str.endswith("Z"):
                         ts_str = ts_str.replace("Z", "+00:00")
@@ -1247,11 +1248,9 @@ class ApifyScraper:
                 except:
                     pass
                     
-            is_video = item.get("videoUrl") is not None
-            media_url = item.get("videoUrl") if is_video else item.get("displayUrl")
-            if not media_url:
-                media_url = item.get("displayUrl") or item.get("url") or ""
-                
+            is_video = item.get("videoUrl") is not None or str(item.get("mediaType", "")).lower() == "video"
+            media_url = item.get("videoUrl") or item.get("mediaUrl") or item.get("displayUrl") or item.get("url") or ""
+            
             if story_id and media_url:
                 stories.append({
                     "id": str(story_id),
