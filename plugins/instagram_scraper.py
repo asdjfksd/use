@@ -482,6 +482,149 @@ def find_cursor_in_dict(d, depth=0):
     return None
 
 
+class HikerAPIScraper:
+    @staticmethod
+    def _headers(api_key):
+        return {
+            "x-access-key": api_key,
+            "Accept": "application/json"
+        }
+
+    @classmethod
+    def get_user_info(cls, username, api_key, host=None):
+        username_clean = username.lstrip("@").strip()
+        url = f"https://api.hikerapi.com/v1/user/by/username?username={username_clean}"
+        response = requests.get(url, headers=cls._headers(api_key), timeout=25)
+        if response.status_code != 200:
+            raise RuntimeError(f"HikerAPI user info failed: Status {response.status_code}")
+            
+        data = response.json()
+        if not data or not isinstance(data, dict):
+            raise RuntimeError("HikerAPI returned empty profile data")
+            
+        return {
+            "id": str(data.get("pk", "")),
+            "username": data.get("username", username_clean),
+            "full_name": data.get("full_name", ""),
+            "biography": data.get("biography", ""),
+            "profile_pic_url": data.get("profile_pic_url", ""),
+            "followers_count": data.get("follower_count", 0),
+            "following_count": data.get("following_count", 0),
+            "posts_count": data.get("media_count", 0)
+        }
+
+    @classmethod
+    def get_latest_posts(cls, username, api_key, host=None, cursor=None):
+        username_clean = username.lstrip("@").strip()
+        
+        info = cls.get_user_info(username_clean, api_key)
+        user_id = info["id"]
+        
+        url = f"https://api.hikerapi.com/v1/user/medias/chunk?user_id={user_id}"
+        params = {}
+        if cursor:
+            params["end_cursor"] = cursor
+            
+        response = requests.get(url, params=params, headers=cls._headers(api_key), timeout=25)
+        if response.status_code != 200:
+            raise RuntimeError(f"HikerAPI posts failed: Status {response.status_code}")
+            
+        res_json = response.json()
+        items = res_json.get("items", []) or []
+        next_c = res_json.get("end_cursor")
+        
+        posts = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            post_id = item.get("id") or item.get("pk")
+            caption_dict = item.get("caption") or {}
+            caption = caption_dict.get("text", "") if isinstance(caption_dict, dict) else str(caption_dict)
+            likes = item.get("like_count", 0)
+            comments = item.get("comment_count", 0)
+            taken_at = item.get("taken_at") or int(time.time())
+            
+            media_url = ""
+            media_type = "image"
+            media_type_raw = item.get("media_type", 1)
+            
+            if item.get("video_versions"):
+                media_type = "video"
+                media_url = item["video_versions"][0].get("url")
+            elif item.get("image_versions2"):
+                candidates = item["image_versions2"].get("candidates", [])
+                if candidates:
+                    media_url = candidates[0].get("url")
+            if not media_url:
+                media_url = item.get("thumbnail_url") or ""
+                
+            if media_url and ("mp4" in media_url or media_type_raw == 2):
+                media_type = "video"
+                
+            if post_id and media_url:
+                posts.append({
+                    "id": str(post_id),
+                    "media_url": media_url,
+                    "media_type": media_type,
+                    "caption": caption,
+                    "taken_at": int(taken_at),
+                    "likes_count": int(likes),
+                    "comments_count": int(comments)
+                })
+        return posts, next_c
+
+    @classmethod
+    def get_latest_stories(cls, username, api_key, host=None):
+        username_clean = username.lstrip("@").strip()
+        url = f"https://api.hikerapi.com/v2/user/stories/by/username?username={username_clean}"
+        response = requests.get(url, headers=cls._headers(api_key), timeout=25)
+        if response.status_code == 404:
+            return []
+        if response.status_code != 200:
+            raise RuntimeError(f"HikerAPI stories failed: Status {response.status_code}")
+            
+        res_json = response.json()
+        items = []
+        if isinstance(res_json, list):
+            items = res_json
+        elif isinstance(res_json, dict):
+            items = res_json.get("items", []) or res_json.get("stories", [])
+            
+        stories = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            story_id = item.get("id") or item.get("pk")
+            taken_at = item.get("taken_at") or int(time.time())
+            
+            media_url = ""
+            media_type = "image"
+            media_type_raw = item.get("media_type", 1)
+            
+            if item.get("video_versions"):
+                media_type = "video"
+                media_url = item["video_versions"][0].get("url")
+            elif item.get("image_versions2"):
+                candidates = item["image_versions2"].get("candidates", [])
+                if candidates:
+                    media_url = candidates[0].get("url")
+                    
+            if not media_url:
+                media_url = item.get("thumbnail_url") or ""
+                
+            if media_url and ("mp4" in media_url or media_type_raw == 2):
+                media_type = "video"
+                
+            if story_id and media_url:
+                stories.append({
+                    "id": str(story_id),
+                    "media_url": media_url,
+                    "media_type": media_type,
+                    "taken_at": int(taken_at)
+                })
+        return stories
+
+
 # --- SCRAPER PROVIDER ADAPTERS ---
 class MockScraper:
     @staticmethod
@@ -1300,6 +1443,8 @@ def execute_with_key_rotation(method_name, username, cursor=None):
             
             if provider == "apify" or host == "apify" or "apify" in str(host).lower() or "apify" in str(provider).lower():
                 scraper_cls = ApifyScraper
+            elif provider == "hikerapi" or "hikerapi" in str(host).lower() or "hikerapi" in str(provider).lower():
+                scraper_cls = HikerAPIScraper
             else:
                 scraper_cls = RapidAPIScraper
                 
@@ -1543,6 +1688,9 @@ def get_instagram_api_keys_markup():
     markup.row(
         InlineKeyboardButton("➕ Add RapidAPI Key", callback_data="instagram_api_add_rapidapi"),
         InlineKeyboardButton("➕ Add Apify Key", callback_data="instagram_api_add_apify")
+    )
+    markup.row(
+        InlineKeyboardButton("➕ Add HikerAPI Key", callback_data="instagram_api_add_hikerapi")
     )
     markup.row(
         InlineKeyboardButton("🍪 Set Apify Session Cookie", callback_data="instagram_api_add_apify_cookie"),
@@ -2607,6 +2755,24 @@ def handle_instagram_callbacks(bot_instance, call):
             parse_mode="HTML"
         )
 
+    elif data == "instagram_api_add_hikerapi":
+        bot_instance.answer_callback_query(call.id)
+        user_states[user_id] = "WAITING_FOR_INSTAGRAM_HIKERAPI_KEY"
+        
+        try:
+            bot_instance.delete_message(chat_id, call.message.message_id)
+        except:
+            pass
+            
+        bot_instance.send_message(
+            chat_id,
+            "🔑 <b>Add New HikerAPI Key</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send your HikerAPI Access Key directly (from your HikerAPI Dashboard).\n\n"
+            "Send <code>/cancel</code> to abort.",
+            parse_mode="HTML"
+        )
+
     elif data == "instagram_api_add_apify_cookie":
         bot_instance.answer_callback_query(call.id)
         user_states[user_id] = "WAITING_FOR_INSTAGRAM_APIFY_COOKIE"
@@ -3277,6 +3443,36 @@ def handle_instagram_inputs(bot_instance, message):
                 commit=True
             )
             bot_instance.reply_to(message, "✅ <b>New Apify API Key added successfully!</b>", parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Error adding duplicate key: {e}")
+            bot_instance.reply_to(message, "⚠️ This API Key is already registered or invalid.", parse_mode="HTML")
+            
+        class CallMock:
+            def __init__(self, from_user, message, cid):
+                self.from_user = from_user
+                self.message = message
+                self.data = cid
+                self.id = "0"
+        handle_instagram_callbacks(bot_instance, CallMock(message.from_user, message, "instagram_api_menu"))
+        return True
+
+    elif state == "WAITING_FOR_INSTAGRAM_HIKERAPI_KEY":
+        user_states[user_id] = None
+        api_key = text.strip().strip("'\" \t\r\n")
+        provider = "hikerapi"
+        host = "hikerapi.com"
+        
+        if not api_key:
+            bot_instance.reply_to(message, "❌ Invalid input. Setting HikerAPI Key aborted.")
+            return True
+            
+        try:
+            db_client.execute_query(
+                "INSERT INTO instagram_api_keys (api_key, provider, host) VALUES (%s, %s, %s)",
+                (api_key, provider, host),
+                commit=True
+            )
+            bot_instance.reply_to(message, "✅ <b>New HikerAPI Key added successfully!</b>", parse_mode="HTML")
         except Exception as e:
             logger.warning(f"Error adding duplicate key: {e}")
             bot_instance.reply_to(message, "⚠️ This API Key is already registered or invalid.", parse_mode="HTML")
