@@ -71,6 +71,20 @@ def init_plugin_db():
                 )
             """)
             conn.commit()
+
+            # Add migration columns for media forwarding
+            columns_to_add = [
+                ("media_sources", "TEXT DEFAULT '[]'"),
+                ("media_interval", "INTEGER DEFAULT 10"),
+                ("media_mix", "INTEGER DEFAULT 0"),
+                ("media_enabled", "INTEGER DEFAULT 0")
+            ]
+            for col_name, col_def in columns_to_add:
+                try:
+                    c.execute(f"ALTER TABLE gm_tasks ADD COLUMN {col_name} {col_def}")
+                    conn.commit()
+                except Exception:
+                    pass
     except Exception as e:
         logger.error(f"Failed to initialize Group Mailer Task database: {e}")
 
@@ -100,7 +114,9 @@ def db_get_tasks():
 def db_get_task(task_id):
     with main_module.db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id FROM gm_tasks WHERE id = ?", (task_id,)) if not main_module.USING_POSTGRES else c.execute("SELECT id, name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id FROM gm_tasks WHERE id = %s", (task_id,))
+        fields = "id, name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id, media_sources, media_interval, media_mix, media_enabled"
+        query = f"SELECT {fields} FROM gm_tasks WHERE id = ?" if not main_module.USING_POSTGRES else f"SELECT {fields} FROM gm_tasks WHERE id = %s"
+        c.execute(query, (task_id,))
         return c.fetchone()
 
 def db_update_task(task_id, field, value):
@@ -173,16 +189,26 @@ async def join_group_via_client(client, link):
         logger.error(f"Join failed for {link}: {e}")
         raise e
 
-# Save the original get_dashboard_markup function
-original_get_dashboard_markup = get_dashboard_markup
+# Save the original get_dashboard_markup function safely to prevent double-wrapping
+if get_dashboard_markup.__name__ != "new_get_dashboard_markup":
+    original_get_dashboard_markup = get_dashboard_markup
 
-def new_get_dashboard_markup():
-    markup = original_get_dashboard_markup()
-    markup.add(InlineKeyboardButton("📬 Group Mailer Tasks", callback_data="gm_tasks_main"))
-    return markup
+    def new_get_dashboard_markup():
+        markup = original_get_dashboard_markup()
+        # Prevent duplicate buttons inside the markup
+        already_has_button = False
+        if hasattr(markup, 'keyboard') and markup.keyboard:
+            for row in markup.keyboard:
+                for btn in row:
+                    if getattr(btn, 'callback_data', None) == "gm_tasks_main":
+                        already_has_button = True
+                        break
+        if not already_has_button:
+            markup.add(InlineKeyboardButton("📬 Group Mailer Tasks", callback_data="gm_tasks_main"))
+        return markup
 
-# Monkeypatch the dashboard markup function
-main_module.get_dashboard_markup = new_get_dashboard_markup
+    # Monkeypatch the dashboard markup function
+    main_module.get_dashboard_markup = new_get_dashboard_markup
 
 # Dynamic fetching dialogs function
 async def fetch_dialogs_async(client, ub_id):
@@ -198,10 +224,11 @@ async def fetch_dialogs_async(client, ub_id):
 
 # Render task control status description
 def get_task_status_text(task):
-    t_id, name, userbot_ids_raw, group_ids_raw, message_raw, interval, last_run_timestamp, update_group = task
+    t_id, name, userbot_ids_raw, group_ids_raw, message_raw, interval, last_run_timestamp, update_group, media_sources_raw, media_interval, media_mix, media_enabled = task
     selected_ubs = json.loads(userbot_ids_raw or "[]")
     selected_groups = json.loads(group_ids_raw or "[]")
     msg_data = json.loads(message_raw or "{}")
+    selected_sources = json.loads(media_sources_raw or "[]")
     
     ub_status = f"🔴 None"
     if selected_ubs:
@@ -228,16 +255,96 @@ def get_task_status_text(task):
         last_run_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_run_timestamp))
         
     update_group_status = f"`{update_group}`" if update_group else "🔴 Muted (No log updates)"
-        
-    return (
+    
+    mode_lbl = "🖼 Fetch Media from Sources" if media_enabled else "💬 Send Static Message"
+    mix_lbl = "🟢 Activated" if media_mix else "🔴 Deactivated"
+    
+    status_text = (
         f"📋 *Task Name:* `{name}` (ID: `{t_id}`)\n"
         f"👤 *Selected Userbots:* {ub_status}\n"
-        f"👥 *Groups Selected:* `{len(selected_groups)}` groups marked\n"
+        f"⚙️ *Mailer Mode:* `{mode_lbl}`\n"
+    )
+    
+    if media_enabled:
+        status_text += (
+            f"📥 *Source Chats:* `{len(selected_sources)}` configured\n"
+            f"⏱ *Media Interval:* `{media_interval} seconds`\n"
+            f"🔀 *Mix Mode:* {mix_lbl}\n"
+        )
+    else:
+        status_text += f"💬 *Mailer Message:* {msg_status}\n"
+        
+    status_text += (
+        f"👥 *Target Groups:* `{len(selected_groups)}` marked\n"
         f"📢 *Update Group:* {update_group_status}\n"
-        f"💬 *Mailer Message:* {msg_status}\n"
         f"⏰ *Repeat Interval:* `{rep_status}`\n"
         f"📅 *Last Run:* `{last_run_time}`"
     )
+    return status_text
+
+def get_task_control_markup(task):
+    t_id = task[0]
+    media_enabled = task[11]
+    media_mix = task[10]
+    
+    markup = InlineKeyboardMarkup()
+    
+    # Row 1: Select Userbots, Select Msg
+    markup.row(
+        InlineKeyboardButton("👤 Select Userbots", callback_data=f"gm_taskubs_{t_id}"),
+        InlineKeyboardButton("💬 Select Msg", callback_data=f"gm_taskmsg_{t_id}")
+    )
+    
+    # Row 2: Target Groups, Repeat Interval
+    markup.row(
+        InlineKeyboardButton("👥 Target Groups", callback_data=f"gm_taskgrps_{t_id}"),
+        InlineKeyboardButton("⏰ Repeat Interval", callback_data=f"gm_taskrep_{t_id}")
+    )
+    
+    # Row 3: Mode Toggle, Mix Toggle
+    mode_btn_text = "🖼 Mode: Fetch Media" if media_enabled else "💬 Mode: Static Msg"
+    mix_btn_text = "🔀 Mix: ON" if media_mix else "🔀 Mix: OFF"
+    markup.row(
+        InlineKeyboardButton(mode_btn_text, callback_data=f"gm_tasktglmode_{t_id}"),
+        InlineKeyboardButton(mix_btn_text, callback_data=f"gm_tasktglmix_{t_id}")
+    )
+    
+    # Row 4: Source Chats, Media Interval
+    markup.row(
+        InlineKeyboardButton("📥 Source Chats", callback_data=f"gm_tasksrcgrps_{t_id}"),
+        InlineKeyboardButton("⏱ Media Interval", callback_data=f"gm_taskmedint_{t_id}")
+    )
+    
+    # Row 5: Import Links, Start Operation
+    markup.row(
+        InlineKeyboardButton("🔗 Import Join Links", callback_data=f"gm_tasklinks_{t_id}"),
+        InlineKeyboardButton("🚀 Start Operation", callback_data=f"gm_taskstart_{t_id}")
+    )
+    
+    # Row 6: Delete Task, Back to list
+    markup.row(
+        InlineKeyboardButton("🗑 Delete Task", callback_data=f"gm_taskdel_{t_id}"),
+        InlineKeyboardButton("🔙 Back to Tasks", callback_data="gm_tasks_list")
+    )
+    return markup
+
+def get_task_control_buttons_telethon(task):
+    t_id = task[0]
+    media_enabled = task[11]
+    media_mix = task[10]
+    
+    from telethon import Button
+    mode_btn_text = "🖼 Mode: Fetch Media" if media_enabled else "💬 Mode: Static Msg"
+    mix_btn_text = "🔀 Mix: ON" if media_mix else "🔀 Mix: OFF"
+    
+    return [
+        [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
+        [Button.inline("👥 Target Groups", f"gm_taskgrps_{t_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}")],
+        [Button.inline(mode_btn_text, f"gm_tasktglmode_{t_id}"), Button.inline(mix_btn_text, f"gm_tasktglmix_{t_id}")],
+        [Button.inline("📥 Source Chats", f"gm_tasksrcgrps_{t_id}"), Button.inline("⏱ Media Interval", f"gm_taskmedint_{t_id}")],
+        [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")],
+        [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
+    ]
 
 # Helper to render the interactive groups checklist page for a specific task
 def show_task_groups_page(chat_id, message_id, task_id, ub_id, page=0):
@@ -309,6 +416,67 @@ def show_task_groups_page(chat_id, message_id, task_id, ub_id, page=0):
         parse_mode="Markdown"
     )
 
+def show_task_sources_page(chat_id, message_id, task_id, ub_id, page=0):
+    groups = userbot_groups_cache.get(ub_id, [])
+    task = db_get_task(task_id)
+    selected_sources = set(json.loads(task[8] or "[]"))
+    
+    if not groups:
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("🔄 Refresh List", callback_data=f"gm_tsrcref_{task_id}_{page}"),
+            InlineKeyboardButton("🔙 Back", callback_data=f"gm_task_view_{task_id}")
+        )
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="📥 *Source Chats:* Userbot is not in any groups/channels yet. Tap **Refresh List** to fetch dialogs dynamically.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        return
+
+    page_size = 8
+    total_pages = (len(groups) + page_size - 1) // page_size
+    page = max(0, min(page, total_pages - 1))
+    
+    start_idx = page * page_size
+    end_idx = start_idx + page_size
+    page_groups = groups[start_idx:end_idx]
+    
+    markup = InlineKeyboardMarkup()
+    for g in page_groups:
+        is_selected = g["id"] in selected_sources
+        checkbox = "✅" if is_selected else "⬜"
+        title = g["title"][:25]
+        markup.add(InlineKeyboardButton(f"{checkbox} {title}", callback_data=f"gm_tsrc_{task_id}_{g['id']}_{page}"))
+        
+    # Navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"gm_tsrcpage_{task_id}_{page-1}"))
+    nav_row.append(InlineKeyboardButton(f"Page {page+1}/{total_pages}", callback_data="gm_noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"gm_tsrcpage_{task_id}_{page+1}"))
+    markup.row(*nav_row)
+    
+    # Bulk actions and Refresh row
+    markup.row(
+        InlineKeyboardButton("Select All", callback_data=f"gm_tsrcselall_{task_id}_{page}"),
+        InlineKeyboardButton("Clear All", callback_data=f"gm_tsrcclrall_{task_id}_{page}"),
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"gm_tsrcref_{task_id}_{page}")
+    )
+    
+    markup.add(InlineKeyboardButton("🔙 Back to Task Panel", callback_data=f"gm_task_view_{task_id}"))
+    
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=f"📥 *SELECT SOURCE CHATS TO FETCH MEDIA* (Selected: `{len(selected_sources)}`)\nToggle source checkboxes. Click **Refresh** to sync:",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
 # Register callback query handler
 @bot.callback_query_handler(func=lambda call: call.data.startswith("gm_task"))
 def handle_tasks_callbacks(call):
@@ -367,32 +535,7 @@ def handle_tasks_callbacks(call):
         # Save active chat ID for scheduler updates
         set_setting("gm_admin_chat_id", str(chat_id))
 
-        markup = InlineKeyboardMarkup()
-        
-        # Row 1: Select Userbots, Select Msg
-        markup.row(
-            InlineKeyboardButton("👤 Select Userbots", callback_data=f"gm_taskubs_{t_id}"),
-            InlineKeyboardButton("💬 Select Msg", callback_data=f"gm_taskmsg_{t_id}")
-        )
-        
-        # Row 2: Groups Selector, Repeat Interval
-        markup.row(
-            InlineKeyboardButton("👥 Groups", callback_data=f"gm_taskgrps_{t_id}"),
-            InlineKeyboardButton("⏰ Repeat Interval", callback_data=f"gm_taskrep_{t_id}")
-        )
-        
-        # Row 3: Import Links, Start Operation
-        markup.row(
-            InlineKeyboardButton("🔗 Import Join Links", callback_data=f"gm_tasklinks_{t_id}"),
-            InlineKeyboardButton("🚀 Start Operation", callback_data=f"gm_taskstart_{t_id}")
-        )
-        
-        # Row 4: Delete Task, Back to list
-        markup.row(
-            InlineKeyboardButton("🗑 Delete Task", callback_data=f"gm_taskdel_{t_id}"),
-            InlineKeyboardButton("🔙 Back to Tasks", callback_data="gm_tasks_list")
-        )
-
+        markup = get_task_control_markup(task)
         status_desc = get_task_status_text(task)
         bot.edit_message_text(
             chat_id=chat_id,
@@ -416,14 +559,24 @@ def handle_tasks_callbacks(call):
 
         markup = InlineKeyboardMarkup(row_width=1)
         for client in connected_clients:
-            c_id = client._me.id
+            c_id = None
+            for uid_key, client_val in userbot_fleet_manager.clients.items():
+                if client_val is client:
+                    c_id = uid_key
+                    break
+            if not c_id:
+                c_id = client._me.id if hasattr(client, '_me') and client._me else None
+            if not c_id:
+                continue
+                
             is_selected = c_id in selected_ubs
             checkbox = "✅" if is_selected else "⬜"
             
-            first_name = client._me.first_name if hasattr(client, '_me') and client._me else "Userbot"
-            username = f"@{client._me.username}" if hasattr(client, '_me') and client._me and client._me.username else ""
+            me = getattr(client, '_me', None)
+            first_name = me.first_name if me else "Userbot"
+            username = f" @{me.username}" if (me and me.username) else f" (ID: {c_id})"
             
-            markup.add(InlineKeyboardButton(f"{checkbox} {first_name} {username}", callback_data=f"gm_tasktglub_{t_id}_{c_id}"))
+            markup.add(InlineKeyboardButton(f"{checkbox} {first_name}{username}", callback_data=f"gm_tasktglub_{t_id}_{c_id}"))
         
         markup.add(InlineKeyboardButton("🔙 Done / Back", callback_data=f"gm_task_view_{t_id}"))
         bot.edit_message_text(
@@ -492,6 +645,53 @@ def handle_tasks_callbacks(call):
             future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, primary_ub), loop)
             future.add_done_callback(on_fetch_done)
 
+    elif data.startswith("gm_tasksrcgrps_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        
+        if not selected_ubs:
+            bot.answer_callback_query(call.id, "⚠️ Please select at least one Userbot first!", show_alert=True)
+            return
+
+        primary_ub = str(selected_ubs[0])
+        client = userbot_fleet_manager.get_client(int(primary_ub))
+        if not client or not client.is_connected():
+            bot.answer_callback_query(call.id, "❌ Primary userbot is offline or disconnected!", show_alert=True)
+            return
+
+        bot.answer_callback_query(call.id, "⏳ Loading source chats...")
+        if primary_ub in userbot_groups_cache:
+            show_task_sources_page(chat_id, message_id, t_id, primary_ub, page=0)
+        else:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⏳ *Fetching source chats list from userbot. Please wait...*",
+                parse_mode="Markdown"
+            )
+            def on_fetch_done(fut):
+                show_task_sources_page(chat_id, message_id, t_id, primary_ub, page=0)
+            
+            future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, primary_ub), loop)
+            future.add_done_callback(on_fetch_done)
+
+    elif data.startswith("gm_tasktglmode_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        new_mode = 0 if task[11] else 1
+        db_update_task(t_id, "media_enabled", new_mode)
+        bot.answer_callback_query(call.id, f"Mode toggled to {'Media Fetcher' if new_mode else 'Static Message'}")
+        handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_task_view_{t_id}", 'message': call.message, 'id': call.id})())
+
+    elif data.startswith("gm_tasktglmix_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        new_mix = 0 if task[10] else 1
+        db_update_task(t_id, "media_mix", new_mix)
+        bot.answer_callback_query(call.id, f"Mix Mode toggled to {'ON' if new_mix else 'OFF'}")
+        handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_task_view_{t_id}", 'message': call.message, 'id': call.id})())
+
     elif data.startswith("gm_tasklinks_"):
         t_id = int(data.split("_")[-1])
         task = db_get_task(t_id)
@@ -544,6 +744,40 @@ def handle_tasks_callbacks(call):
         
         db_update_task(t_id, "repeat_interval", minutes)
         bot.answer_callback_query(call.id, "✅ Repeat interval updated!")
+        handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_task_view_{t_id}", 'message': call.message, 'id': call.id})())
+
+    elif data.startswith("gm_taskmedint_"):
+        t_id = int(data.split("_")[-1])
+        markup = InlineKeyboardMarkup()
+        markup.row(
+            InlineKeyboardButton("2 Sec", callback_data=f"gm_tasksetmedint_{t_id}_2"),
+            InlineKeyboardButton("5 Sec", callback_data=f"gm_tasksetmedint_{t_id}_5")
+        )
+        markup.row(
+            InlineKeyboardButton("10 Sec", callback_data=f"gm_tasksetmedint_{t_id}_10"),
+            InlineKeyboardButton("15 Sec", callback_data=f"gm_tasksetmedint_{t_id}_15")
+        )
+        markup.row(
+            InlineKeyboardButton("20 Sec", callback_data=f"gm_tasksetmedint_{t_id}_20"),
+            InlineKeyboardButton("30 Sec", callback_data=f"gm_tasksetmedint_{t_id}_30")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"gm_task_view_{t_id}"))
+        
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="⏱ *SELECT MEDIA INTERVAL*\nConfigure the delay in seconds between each media message being sent:",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("gm_tasksetmedint_"):
+        parts = data.split("_")
+        t_id = int(parts[2])
+        seconds = int(parts[3])
+        
+        db_update_task(t_id, "media_interval", seconds)
+        bot.answer_callback_query(call.id, f"✅ Media interval updated to {seconds}s!")
         handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_task_view_{t_id}", 'message': call.message, 'id': call.id})())
 
     elif data.startswith("gm_taskdel_"):
@@ -606,6 +840,34 @@ def handle_task_checklist_callbacks(call):
         show_task_groups_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
         bot.answer_callback_query(call.id)
 
+    # gm_tsrc_{task_id}_{group_id}_{page}
+    elif data.startswith("gm_tsrc_"):
+        t_id = int(parts[2])
+        g_id = int(parts[3])
+        page = int(parts[4])
+        
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        selected_sources = json.loads(task[8] or "[]")
+        
+        if g_id in selected_sources:
+            selected_sources.remove(g_id)
+        else:
+            selected_sources.append(g_id)
+            
+        db_update_task(t_id, "media_sources", json.dumps(selected_sources))
+        show_task_sources_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
+        bot.answer_callback_query(call.id)
+
+    # gm_tsrcpage_{task_id}_{page}
+    elif data.startswith("gm_tsrcpage_"):
+        t_id = int(parts[2])
+        page = int(parts[3])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        show_task_sources_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
+        bot.answer_callback_query(call.id)
+
     # gm_tpage_{task_id}_{page}
     elif data.startswith("gm_tpage_"):
         t_id = int(parts[2])
@@ -632,6 +894,23 @@ def handle_task_checklist_callbacks(call):
         show_task_groups_page(chat_id, message_id, t_id, primary_ub, page)
         bot.answer_callback_query(call.id, "✅ Selected all groups!")
 
+    # gm_tsrcselall_{task_id}_{page}
+    elif data.startswith("gm_tsrcselall_"):
+        t_id = int(parts[2])
+        page = int(parts[3])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        primary_ub = str(selected_ubs[0])
+        groups = userbot_groups_cache.get(primary_ub, [])
+        
+        selected_sources = set(json.loads(task[8] or "[]"))
+        for g in groups:
+            selected_sources.add(g["id"])
+            
+        db_update_task(t_id, "media_sources", json.dumps(list(selected_sources)))
+        show_task_sources_page(chat_id, message_id, t_id, primary_ub, page)
+        bot.answer_callback_query(call.id, "✅ Selected all source chats!")
+
     # gm_tclrall_{task_id}_{page}
     elif data.startswith("gm_tclrall_"):
         t_id = int(parts[2])
@@ -641,6 +920,16 @@ def handle_task_checklist_callbacks(call):
         db_update_task(t_id, "group_ids", "[]")
         show_task_groups_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
         bot.answer_callback_query(call.id, "🗑 Cleared selections!")
+
+    # gm_tsrcclrall_{task_id}_{page}
+    elif data.startswith("gm_tsrcclrall_"):
+        t_id = int(parts[2])
+        page = int(parts[3])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        db_update_task(t_id, "media_sources", "[]")
+        show_task_sources_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
+        bot.answer_callback_query(call.id, "🗑 Cleared source selections!")
 
     # gm_tref_{task_id}_{page}
     elif data.startswith("gm_tref_"):
@@ -668,6 +957,36 @@ def handle_task_checklist_callbacks(call):
             
         def on_sync_done(fut):
             show_task_groups_page(chat_id, message_id, t_id, primary_ub, page)
+            
+        future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, primary_ub), loop)
+        future.add_done_callback(on_sync_done)
+
+    # gm_tsrcref_{task_id}_{page}
+    elif data.startswith("gm_tsrcref_"):
+        t_id = int(parts[2])
+        page = int(parts[3])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        primary_ub = str(selected_ubs[0])
+        
+        client = userbot_fleet_manager.get_client(int(primary_ub))
+        if not client or not client.is_connected():
+            bot.answer_callback_query(call.id, "❌ Selected userbot is offline!", show_alert=True)
+            return
+            
+        bot.answer_callback_query(call.id, "🔄 Syncing source chats...")
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="🔄 *Syncing source chats from Telegram... Please wait...*",
+            parse_mode="Markdown"
+        )
+        
+        if primary_ub in userbot_groups_cache:
+            del userbot_groups_cache[primary_ub]
+            
+        def on_sync_done(fut):
+            show_task_sources_page(chat_id, message_id, t_id, primary_ub, page)
             
         future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, primary_ub), loop)
         future.add_done_callback(on_sync_done)
@@ -846,8 +1165,9 @@ async def run_task_broadcast(task_id, is_auto=False):
     if not task:
         return
         
-    _, name, userbot_ids_raw, group_ids_raw, message_raw, interval, _, update_group_id = task
+    t_id, name, userbot_ids_raw, group_ids_raw, message_raw, interval, _, update_group_id, media_sources_raw, media_interval, media_mix, media_enabled = task
     ub_ids = json.loads(userbot_ids_raw or "[]")
+    selected_groups = json.loads(group_ids_raw or "[]")
     msg_data = json.loads(message_raw or "{}")
     
     success = 0
@@ -856,161 +1176,357 @@ async def run_task_broadcast(task_id, is_auto=False):
     
     dest_chat = int(update_group_id) if (update_group_id and update_group_id.strip()) else None
 
-    progress_msg = None
-    if dest_chat:
-        try:
-            progress_msg = bot.send_message(dest_chat, f"⏳ *{label} progress:* `0%`", parse_mode="Markdown")
-        except Exception as err:
-            logger.error(f"Failed to send task progress updates to {dest_chat}: {err}")
-
     # Update database last run timestamp
     db_update_task(task_id, "last_run", time.time())
     
-    sent_group_ids = set()
+    if not ub_ids or not selected_groups:
+        return
+
+    # Use primary userbot to resolve entities/join links and manage log messages
+    primary_ub = ub_ids[0]
+    client = userbot_fleet_manager.get_client(int(primary_ub))
+    if not client or not client.is_connected():
+        if dest_chat:
+            try:
+                bot.send_message(dest_chat, f"❌ *{label} Failed:* Primary userbot is offline.")
+            except Exception:
+                pass
+        return
+
+    links_map = db_get_links_map()
     failed_details = []
     
-    # Pre-load group titles from local cache
-    group_titles = {}
-    for ub_id in ub_ids:
-        for g in userbot_groups_cache.get(str(ub_id), []):
-            group_titles[g["id"]] = g["title"]
-
-    while True:
-        # Re-fetch task to load live group ids dynamically on every loop step
-        live_task = db_get_task(task_id)
-        if not live_task:
-            break
-            
-        live_group_ids = json.loads(live_task[3] or "[]")
-        links_map = db_get_links_map()
-        
-        remaining_groups = [g for g in live_group_ids if g not in sent_group_ids]
-        if not remaining_groups:
-            break
-            
-        group_id = remaining_groups[0]
-        sent_group_ids.add(group_id)
-        
-        group_sent_successfully = False
-        group_errors = []
-
-        # Iterate over all selected userbots
-        for ub_id in ub_ids:
-            client = userbot_fleet_manager.get_client(int(ub_id))
-            if not client or not client.is_connected():
-                group_errors.append((ub_id, "Userbot offline"))
-                continue
-
-            try:
-                entity = group_id
+    if media_enabled:
+        # --- MEDIA MODE ---
+        selected_sources = json.loads(media_sources_raw or "[]")
+        if not selected_sources:
+            if dest_chat:
                 try:
-                    if isinstance(group_id, str) and group_id.startswith("@"):
-                        entity = await client.get_entity(group_id)
-                    elif isinstance(group_id, str) and group_id.isdigit():
-                        entity = int(group_id)
-                except Exception as ent_err:
-                    join_link = links_map.get(str(group_id))
-                    if join_link:
+                    bot.send_message(dest_chat, f"❌ *{label} Failed:* No media sources configured.")
+                except Exception:
+                    pass
+            return
+            
+        progress_msg = None
+        if dest_chat:
+            try:
+                progress_msg = bot.send_message(dest_chat, f"⏳ *{label}:* Fetching media from sources...", parse_mode="Markdown")
+            except Exception:
+                pass
+            
+        # Fetch media messages from all sources
+        media_items = []
+        for src_id in selected_sources:
+            try:
+                async for msg in client.iter_messages(src_id, limit=30):
+                    if msg.media:
+                        media_items.append(msg)
+            except Exception as e:
+                logger.error(f"Error fetching media from {src_id}: {e}")
+                
+        if not media_items:
+            if dest_chat:
+                try:
+                    bot.send_message(dest_chat, f"❌ *{label} Completed:* No media messages found in source groups.", parse_mode="Markdown")
+                except Exception:
+                    pass
+            return
+            
+        if media_mix:
+            random.shuffle(media_items)
+            
+        total_media = len(media_items)
+        total_targets = len(selected_groups)
+        
+        for idx, msg in enumerate(media_items):
+            # Re-fetch task dynamically on every loop step
+            live_task = db_get_task(task_id)
+            if not live_task:
+                break
+                
+            for t_idx, group_id in enumerate(selected_groups):
+                group_sent_successfully = False
+                group_errors = []
+                
+                # Failover through configured userbots
+                for ub_id in ub_ids:
+                    ub_client = userbot_fleet_manager.get_client(int(ub_id))
+                    if not ub_client or not ub_client.is_connected():
+                        group_errors.append((ub_id, "Userbot offline"))
+                        continue
+                        
+                    try:
+                        entity = group_id
                         try:
+                            if isinstance(group_id, str) and group_id.startswith("@"):
+                                entity = await ub_client.get_entity(group_id)
+                            elif isinstance(group_id, str) and group_id.isdigit():
+                                entity = int(group_id)
+                        except Exception as ent_err:
+                            join_link = links_map.get(str(group_id))
+                            if join_link:
+                                try:
+                                    await join_group_via_client(ub_client, join_link)
+                                    await asyncio.sleep(random.randint(5, 10))
+                                    entity = group_id
+                                    if isinstance(group_id, str) and group_id.startswith("@"):
+                                        entity = await ub_client.get_entity(group_id)
+                                    elif isinstance(group_id, str) and group_id.isdigit():
+                                        entity = int(group_id)
+                                except Exception as join_err:
+                                    raise Exception(f"Auto-join failed: {join_err}")
+                            else:
+                                raise ent_err
+                                
+                        # Try direct send by file reference first
+                        try:
+                            await ub_client.send_file(entity, msg.media, caption=msg.message)
+                        except Exception as send_err:
+                            # Fallback: Download locally and upload/send
+                            temp_file = await ub_client.download_media(msg)
+                            if temp_file:
+                                await ub_client.send_file(entity, temp_file, caption=msg.message)
+                                try:
+                                    os.remove(temp_file)
+                                except Exception:
+                                    pass
+                            else:
+                                raise send_err
+                                
+                        group_sent_successfully = True
+                        break
+                    except Exception as e:
+                        try:
+                            # Retry auto-join check
+                            join_link = links_map.get(str(group_id))
+                            if join_link and "auto-join failed" not in str(e).lower():
+                                await join_group_via_client(ub_client, join_link)
+                                await asyncio.sleep(random.randint(5, 10))
+                                try:
+                                    await ub_client.send_file(entity, msg.media, caption=msg.message)
+                                except Exception as inner_send_err:
+                                    temp_file = await ub_client.download_media(msg)
+                                    if temp_file:
+                                        await ub_client.send_file(entity, temp_file, caption=msg.message)
+                                        try: os.remove(temp_file)
+                                        except Exception: pass
+                                    else:
+                                        raise inner_send_err
+                                group_sent_successfully = True
+                                break
+                        except Exception as retry_err:
+                            e = retry_err
+                        group_errors.append((ub_id, e))
+                        
+                if group_sent_successfully:
+                    success += 1
+                else:
+                    failed += 1
+                    report_lines = [f"❌ *Media {idx+1} to Target ID:* `{group_id}`"]
+                    for ub_id, err in group_errors:
+                        report_lines.append(f"  ⚠️ *UB {ub_id}:* {get_friendly_error(err)}")
+                    failed_details.append("\n".join(report_lines))
+                    
+                # Update progress
+                if progress_msg and dest_chat:
+                    try:
+                        pct = int((((idx * total_targets) + (t_idx + 1)) / (total_media * total_targets)) * 100)
+                        bot.edit_message_text(
+                            chat_id=dest_chat,
+                            message_id=progress_msg.message_id,
+                            text=(
+                                f"⏳ *{label} (Media Mode):* `{pct}%` Done\n"
+                                f"📷 Media: `{idx+1}/{total_media}` | Target: `{t_idx+1}/{total_targets}`\n"
+                                f"🟢 Success: `{success}` | 🔴 Failed: `{failed}`"
+                            ),
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+                        
+                # Small delay between target groups to prevent flooding
+                await asyncio.sleep(2)
+                
+            # Wait configured interval between sending each media item
+            await asyncio.sleep(media_interval)
+            
+        if dest_chat:
+            try:
+                bot.send_message(
+                    dest_chat,
+                    f"✅ *{label} (Media Mode) Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+                
+        # Send failure details
+        if failed_details and dest_chat:
+            try:
+                header = f"🚨 *{label} Failure Report (Media Mode):*\n\n"
+                current_message = header
+                for report in failed_details:
+                    if len(current_message) + len(report) + 2 > 4000:
+                        bot.send_message(dest_chat, current_message, parse_mode="Markdown")
+                        current_message = ""
+                    current_message += report + "\n\n"
+                if current_message.strip():
+                    bot.send_message(dest_chat, current_message, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Error sending failure report: {e}")
+                
+    else:
+        # --- ORIGINAL STATIC MESSAGE MODE ---
+        progress_msg = None
+        if dest_chat:
+            try:
+                progress_msg = bot.send_message(dest_chat, f"⏳ *{label} progress:* `0%`", parse_mode="Markdown")
+            except Exception as err:
+                logger.error(f"Failed to send task progress updates to {dest_chat}: {err}")
+
+        sent_group_ids = set()
+        
+        # Pre-load group titles from local cache
+        group_titles = {}
+        for ub_id in ub_ids:
+            for g in userbot_groups_cache.get(str(ub_id), []):
+                group_titles[g["id"]] = g["title"]
+
+        while True:
+            # Re-fetch task to load live group ids dynamically on every loop step
+            live_task = db_get_task(task_id)
+            if not live_task:
+                break
+                
+            live_group_ids = json.loads(live_task[3] or "[]")
+            
+            remaining_groups = [g for g in live_group_ids if g not in sent_group_ids]
+            if not remaining_groups:
+                break
+                
+            group_id = remaining_groups[0]
+            sent_group_ids.add(group_id)
+            
+            group_sent_successfully = False
+            group_errors = []
+
+            # Iterate over all selected userbots
+            for ub_id in ub_ids:
+                client = userbot_fleet_manager.get_client(int(ub_id))
+                if not client or not client.is_connected():
+                    group_errors.append((ub_id, "Userbot offline"))
+                    continue
+
+                try:
+                    entity = group_id
+                    try:
+                        if isinstance(group_id, str) and group_id.startswith("@"):
+                            entity = await client.get_entity(group_id)
+                        elif isinstance(group_id, str) and group_id.isdigit():
+                            entity = int(group_id)
+                    except Exception as ent_err:
+                        join_link = links_map.get(str(group_id))
+                        if join_link:
+                            try:
+                                await join_group_via_client(client, join_link)
+                                join_wait = random.randint(5, 10)
+                                await asyncio.sleep(join_wait)
+                                entity = group_id
+                                if isinstance(group_id, str) and group_id.startswith("@"):
+                                    entity = await client.get_entity(group_id)
+                                elif isinstance(group_id, str) and group_id.isdigit():
+                                    entity = int(group_id)
+                            except Exception as join_err:
+                                raise Exception(f"Auto-join failed: {join_err}")
+                        else:
+                            raise ent_err
+
+                    # Send
+                    msg_type = msg_data.get("type")
+                    if msg_type == "text":
+                        await client.send_message(entity, msg_data["text"])
+                    elif msg_type in ["photo", "video", "document"]:
+                        await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
+                    
+                    group_sent_successfully = True
+                    break
+                except Exception as e:
+                    try:
+                        join_link = links_map.get(str(group_id))
+                        if join_link and "auto-join failed" not in str(e).lower():
                             await join_group_via_client(client, join_link)
                             join_wait = random.randint(5, 10)
                             await asyncio.sleep(join_wait)
-                            entity = group_id
-                            if isinstance(group_id, str) and group_id.startswith("@"):
-                                entity = await client.get_entity(group_id)
-                            elif isinstance(group_id, str) and group_id.isdigit():
-                                entity = int(group_id)
-                        except Exception as join_err:
-                            raise Exception(f"Auto-join failed: {join_err}")
-                    else:
-                        raise ent_err
+                            
+                            msg_type = msg_data.get("type")
+                            if msg_type == "text":
+                                await client.send_message(entity, msg_data["text"])
+                            elif msg_type in ["photo", "video", "document"]:
+                                await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
+                            
+                            group_sent_successfully = True
+                            break
+                    except Exception as retry_err:
+                        e = retry_err
+                    
+                    group_errors.append((ub_id, e))
+                    logger.warning(f"Userbot {ub_id} failed to send to {group_id} under Task {task_id}: {e}")
+            
+            if group_sent_successfully:
+                success += 1
+            else:
+                failed += 1
+                g_title = group_titles.get(group_id, f"ID: {group_id}")
+                report_lines = [f"❌ *Group:* `{g_title}`"]
+                for ub_id, err in group_errors:
+                    report_lines.append(f"  ⚠️ *UB {ub_id}:* {get_friendly_error(err)}")
+                failed_details.append("\n".join(report_lines))
 
-                # Send
-                msg_type = msg_data.get("type")
-                if msg_type == "text":
-                    await client.send_message(entity, msg_data["text"])
-                elif msg_type in ["photo", "video", "document"]:
-                    await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
-                
-                group_sent_successfully = True
-                break
-            except Exception as e:
+            # Live progress update
+            total_groups = len(live_group_ids)
+            processed_count = len(sent_group_ids)
+            
+            if progress_msg and dest_chat and (processed_count % 3 == 0 or processed_count == total_groups):
+                pct = int((processed_count / max(1, total_groups)) * 100)
                 try:
-                    join_link = links_map.get(str(group_id))
-                    if join_link and "auto-join failed" not in str(e).lower():
-                        await join_group_via_client(client, join_link)
-                        join_wait = random.randint(5, 10)
-                        await asyncio.sleep(join_wait)
-                        
-                        msg_type = msg_data.get("type")
-                        if msg_type == "text":
-                            await client.send_message(entity, msg_data["text"])
-                        elif msg_type in ["photo", "video", "document"]:
-                            await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
-                        
-                        group_sent_successfully = True
-                        break
-                except Exception as retry_err:
-                    e = retry_err
-                
-                group_errors.append((ub_id, e))
-                logger.warning(f"Userbot {ub_id} failed to send to {group_id} under Task {task_id}: {e}")
-        
-        if group_sent_successfully:
-            success += 1
-        else:
-            failed += 1
-            g_title = group_titles.get(group_id, f"ID: {group_id}")
-            report_lines = [f"❌ *Group:* `{g_title}`"]
-            for ub_id, err in group_errors:
-                report_lines.append(f"  ⚠️ *UB {ub_id}:* {get_friendly_error(err)}")
-            failed_details.append("\n".join(report_lines))
+                    bot.edit_message_text(
+                        chat_id=dest_chat,
+                        message_id=progress_msg.message_id,
+                        text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}` | Total: `{total_groups}`)",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
 
-        # Live progress update
-        total_groups = len(live_group_ids)
-        processed_count = len(sent_group_ids)
-        
-        if progress_msg and dest_chat and (processed_count % 3 == 0 or processed_count == total_groups):
-            pct = int((processed_count / max(1, total_groups)) * 100)
+            # Random delay between 5 to 10 seconds
+            await asyncio.sleep(random.randint(5, 10))
+
+        if dest_chat:
             try:
-                bot.edit_message_text(
-                    chat_id=dest_chat,
-                    message_id=progress_msg.message_id,
-                    text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}` | Total: `{total_groups}`)",
+                bot.send_message(
+                    dest_chat,
+                    f"✅ *{label} Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
                     parse_mode="Markdown"
                 )
             except Exception:
                 pass
 
-        # Random delay between 5 to 10 seconds
-        await asyncio.sleep(random.randint(5, 10))
-
-    if dest_chat:
-        try:
-            bot.send_message(
-                dest_chat,
-                f"✅ *{label} Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-    # Send Detailed Failure Report
-    if failed_details and dest_chat:
-        try:
-            header = f"🚨 *{label} Failure Report:*\nThe message could not be sent to these groups on all configured accounts:\n\n"
-            current_message = header
-            
-            for report in failed_details:
-                if len(current_message) + len(report) + 2 > 4000:
-                    bot.send_message(dest_chat, current_message, parse_mode="Markdown")
-                    current_message = ""
-                current_message += report + "\n\n"
+        # Send Detailed Failure Report
+        if failed_details and dest_chat:
+            try:
+                header = f"🚨 *{label} Failure Report:*\nThe message could not be sent to these groups on all configured accounts:\n\n"
+                current_message = header
                 
-            if current_message.strip():
-                bot.send_message(dest_chat, current_message, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Error sending failure report: {e}")
+                for report in failed_details:
+                    if len(current_message) + len(report) + 2 > 4000:
+                        bot.send_message(dest_chat, current_message, parse_mode="Markdown")
+                        current_message = ""
+                    current_message += report + "\n\n"
+                    
+                if current_message.strip():
+                    bot.send_message(dest_chat, current_message, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Error sending failure report: {e}")
 
 
 # Background Scheduled Supervisor Loop for Campaign Tasks
@@ -1021,27 +1537,34 @@ async def scheduler_loop():
             # Query all tasks with repeat schedules
             with main_module.db_conn() as conn:
                 c = conn.cursor()
-                c.execute("SELECT id, name, repeat_interval, last_run, userbot_ids, group_ids, message FROM gm_tasks WHERE repeat_interval > 0")
+                c.execute("SELECT id, name, repeat_interval, last_run, userbot_ids, group_ids, message, media_sources, media_enabled FROM gm_tasks WHERE repeat_interval > 0")
                 tasks = c.fetchall()
                 
-            for t_id, name, interval, last_run, userbot_ids_raw, group_ids_raw, message_raw in tasks:
+            for t_id, name, interval, last_run, userbot_ids_raw, group_ids_raw, message_raw, media_sources_raw, media_enabled in tasks:
                 now = time.time()
                 if now - last_run >= (interval * 60):
                     ub_ids = json.loads(userbot_ids_raw or "[]")
                     selected_groups = json.loads(group_ids_raw or "[]")
                     msg_data = json.loads(message_raw or "{}")
+                    selected_sources = json.loads(media_sources_raw or "[]")
                     
-                    if ub_ids and selected_groups and msg_data:
-                        has_active_client = False
+                    has_active_client = False
+                    if ub_ids:
                         for ub_id in ub_ids:
                             client = userbot_fleet_manager.get_client(int(ub_id))
                             if client and client.is_connected():
                                 has_active_client = True
                                 break
                                 
-                        if has_active_client:
-                            # Start campaign task asynchronously
-                            await run_task_broadcast(t_id, is_auto=True)
+                    if has_active_client and selected_groups:
+                        if media_enabled:
+                            if selected_sources:
+                                # Start campaign task asynchronously
+                                await run_task_broadcast(t_id, is_auto=True)
+                        else:
+                            if msg_data:
+                                # Start campaign task asynchronously
+                                await run_task_broadcast(t_id, is_auto=True)
         except Exception as e:
             logger.error(f"Error in Tasks scheduler loop: {e}")
             
@@ -1395,6 +1918,63 @@ def setup_group_mailer_handlers(client):
             buttons=buttons
         )
 
+    async def show_task_sources_page_telethon_helper(client_inst, event, task_id, page=0):
+        task = db_get_task(task_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        if not selected_ubs:
+            await event.reply("❌ **Please select a userbot first!**")
+            return
+        primary_ub = str(selected_ubs[0])
+        groups = userbot_groups_cache.get(primary_ub, [])
+        selected_sources = set(json.loads(task[8] or "[]"))
+        
+        from telethon import Button
+        if not groups:
+            buttons = [
+                [Button.inline("🔄 Refresh List", f"gm_tsrcref_{task_id}_{page}")],
+                [Button.inline("🔙 Back to Task Panel", f"gm_task_view_{task_id}")]
+            ]
+            await event.edit("📥 *Source Chats:* Userbot is not in any groups/channels yet. Tap **Refresh List** to fetch dialogs dynamically.", buttons=buttons)
+            return
+
+        page_size = 8
+        total_pages = (len(groups) + page_size - 1) // page_size
+        page = max(0, min(page, total_pages - 1))
+        
+        start_idx = page * page_size
+        end_idx = start_idx + page_size
+        page_groups = groups[start_idx:end_idx]
+        
+        buttons = []
+        for g in page_groups:
+            is_selected = g["id"] in selected_sources
+            checkbox = "✅" if is_selected else "⬜"
+            title = g["title"][:25]
+            buttons.append([Button.inline(f"{checkbox} {title}", f"gm_tsrc_{task_id}_{g['id']}_{page}")])
+            
+        # Navigation row
+        nav_row = []
+        if page > 0:
+            nav_row.append(Button.inline("◀️ Prev", f"gm_tsrcpage_{task_id}_{page-1}"))
+        nav_row.append(Button.inline(f"Page {page+1}/{total_pages}", "gm_noop"))
+        if page < total_pages - 1:
+            nav_row.append(Button.inline("Next ▶️", f"gm_tsrcpage_{task_id}_{page+1}"))
+        buttons.append(nav_row)
+        
+        # Bulk actions and Refresh row
+        buttons.append([
+            Button.inline("Select All", f"gm_tsrcselall_{task_id}_{page}"),
+            Button.inline("Clear All", f"gm_tsrcclrall_{task_id}_{page}"),
+            Button.inline("🔄 Refresh", f"gm_tsrcref_{task_id}_{page}")
+        ])
+        
+        buttons.append([Button.inline("🔙 Back to Task Panel", f"gm_task_view_{task_id}")])
+        
+        await event.edit(
+            f"📥 **SELECT SOURCE CHATS TO FETCH MEDIA** (Selected: `{len(selected_sources)}`)\nToggle source checkboxes. Click **Refresh** to sync:",
+            buttons=buttons
+        )
+
     @client.on(events.NewMessage)
     async def group_mailer_private_cmd_handler(event):
         m = event.message
@@ -1434,13 +2014,7 @@ def setup_group_mailer_handlers(client):
                     admin_states.pop(m.sender_id, None)
                     task = db_get_task(t_id)
                     status_desc = get_task_status_text(task)
-                    from telethon import Button
-                    buttons = [
-                        [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
-                        [Button.inline("👥 Groups", f"gm_taskgrps_{t_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}")],
-                        [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")],
-                        [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
-                    ]
+                    buttons = get_task_control_buttons_telethon(task)
                     await event.reply(f"✅ **Task Created:** `{task_name}`\n\n📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
                 else:
                     await event.reply("❌ Invalid input. Task name cannot be empty.")
@@ -1486,13 +2060,7 @@ def setup_group_mailer_handlers(client):
                 
                 task = db_get_task(t_id)
                 status_desc = get_task_status_text(task)
-                from telethon import Button
-                buttons = [
-                    [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
-                    [Button.inline("👥 Groups", f"gm_taskgrps_{t_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}")],
-                    [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")],
-                    [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
-                ]
+                buttons = get_task_control_buttons_telethon(task)
                 await event.reply(f"✅ **Mailer Message Saved for Task!** (Type: `{msg_type.upper()}`)\n\n📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
                 return
 
@@ -1575,13 +2143,7 @@ def setup_group_mailer_handlers(client):
                     
                     task_updated = db_get_task(t_id)
                     status_desc = get_task_status_text(task_updated)
-                    from telethon import Button
-                    buttons = [
-                        [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
-                        [Button.inline("👥 Groups", f"gm_taskgrps_{t_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}")],
-                        [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")],
-                        [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
-                    ]
+                    buttons = get_task_control_buttons_telethon(task_updated)
                     await event.reply(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
                     
                 asyncio.create_task(run_import())
@@ -1778,13 +2340,7 @@ def setup_group_mailer_handlers(client):
             
             task = db_get_task(t_id)
             status_desc = get_task_status_text(task)
-            from telethon import Button
-            buttons = [
-                [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
-                [Button.inline("👥 Groups", f"gm_taskgrps_{t_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}")],
-                [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")],
-                [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
-            ]
+            buttons = get_task_control_buttons_telethon(task)
             await event.reply(f"✅ **Task Created Successfully!**\n\n📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
             return
 
@@ -1801,13 +2357,7 @@ def setup_group_mailer_handlers(client):
         if matched_task_id:
             task = db_get_task(matched_task_id)
             status_desc = get_task_status_text(task)
-            from telethon import Button
-            buttons = [
-                [Button.inline("👤 Select Userbots", f"gm_taskubs_{matched_task_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{matched_task_id}")],
-                [Button.inline("👥 Groups", f"gm_taskgrps_{matched_task_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{matched_task_id}")],
-                [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{matched_task_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{matched_task_id}")],
-                [Button.inline("🗑 Delete Task", f"gm_taskdel_{matched_task_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
-            ]
+            buttons = get_task_control_buttons_telethon(task)
             await event.reply(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
             return
 
@@ -1866,12 +2416,7 @@ def setup_group_mailer_handlers(client):
                 return
 
             status_desc = get_task_status_text(task)
-            buttons = [
-                [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
-                [Button.inline("👥 Groups", f"gm_taskgrps_{t_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}")],
-                [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")],
-                [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
-            ]
+            buttons = get_task_control_buttons_telethon(task)
             await event.edit(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
             await event.answer()
 
@@ -1889,12 +2434,24 @@ def setup_group_mailer_handlers(client):
 
             buttons = []
             for cl in connected_clients:
-                c_id = cl._me.id
+                c_id = None
+                for uid_key, client_val in userbot_fleet_manager.clients.items():
+                    if client_val is cl:
+                        c_id = uid_key
+                        break
+                if not c_id:
+                    c_id = cl._me.id if hasattr(cl, '_me') and cl._me else None
+                if not c_id:
+                    continue
+                    
                 is_selected = c_id in selected_ubs
                 checkbox = "✅" if is_selected else "⬜"
-                first_name = cl._me.first_name if hasattr(cl, '_me') and cl._me else "Userbot"
-                username = f"@{cl._me.username}" if hasattr(cl, '_me') and cl._me and cl._me.username else ""
-                buttons.append([Button.inline(f"{checkbox} {first_name} {username}", f"gm_tasktglub_{t_id}_{c_id}")])
+                
+                me = getattr(cl, '_me', None)
+                first_name = me.first_name if me else "Userbot"
+                username = f" @{me.username}" if (me and me.username) else f" (ID: {c_id})"
+                
+                buttons.append([Button.inline(f"{checkbox} {first_name}{username}", f"gm_tasktglub_{t_id}_{c_id}")])
             
             buttons.append([Button.inline("🔙 Done / Back", f"gm_task_view_{t_id}")])
             await event.edit(f"👤 **Select Userbots for task `{task[1]}` (Multiple selection enabled):**", buttons=buttons)
@@ -1920,12 +2477,22 @@ def setup_group_mailer_handlers(client):
             connected_clients = [c for c in clients if c.is_connected()]
             buttons = []
             for cl in connected_clients:
-                c_id = cl._me.id
+                c_id = None
+                for uid_key, client_val in userbot_fleet_manager.clients.items():
+                    if client_val is cl:
+                        c_id = uid_key
+                        break
+                if not c_id:
+                    c_id = cl._me.id if hasattr(cl, '_me') and cl._me else None
+                if not c_id:
+                    continue
                 is_selected = c_id in selected_ubs
                 checkbox = "✅" if is_selected else "⬜"
-                first_name = cl._me.first_name if hasattr(cl, '_me') and cl._me else "Userbot"
-                username = f"@{cl._me.username}" if hasattr(cl, '_me') and cl._me and cl._me.username else ""
-                buttons.append([Button.inline(f"{checkbox} {first_name} {username}", f"gm_tasktglub_{t_id}_{c_id}")])
+                
+                me = getattr(cl, '_me', None)
+                first_name = me.first_name if me else "Userbot"
+                username = f" @{me.username}" if (me and me.username) else f" (ID: {c_id})"
+                buttons.append([Button.inline(f"{checkbox} {first_name}{username}", f"gm_tasktglub_{t_id}_{c_id}")])
             buttons.append([Button.inline("🔙 Done / Back", f"gm_task_view_{t_id}")])
             await event.edit(f"👤 **Select Userbots for task `{task[1]}` (Multiple selection enabled):**", buttons=buttons)
 
@@ -1939,6 +2506,47 @@ def setup_group_mailer_handlers(client):
             t_id = int(parts[-1])
             await show_task_groups_page_telethon_helper(client, event, t_id, page=0)
             await event.answer()
+
+        elif data.startswith("gm_tasksrcgrps_"):
+            t_id = int(parts[-1])
+            task = db_get_task(t_id)
+            selected_ubs = json.loads(task[2] or "[]")
+            if not selected_ubs:
+                await event.answer("❌ Please select a userbot first!", alert=True)
+                return
+            primary_ub = str(selected_ubs[0])
+            target_client = userbot_fleet_manager.get_client(int(primary_ub))
+            if not target_client or not target_client.is_connected():
+                await event.answer("❌ Selected userbot is offline!", alert=True)
+                return
+                
+            await event.answer("🔄 Loading source chats...")
+            await event.edit("⏳ *Fetching source chats list... Please wait...*")
+            if primary_ub not in userbot_groups_cache:
+                await fetch_dialogs_async(target_client, primary_ub)
+            await show_task_sources_page_telethon_helper(client, event, t_id, page=0)
+
+        elif data.startswith("gm_tasktglmode_"):
+            t_id = int(parts[-1])
+            task = db_get_task(t_id)
+            new_mode = 0 if task[11] else 1
+            db_update_task(t_id, "media_enabled", new_mode)
+            await event.answer(f"Mode toggled to {'Media Fetcher' if new_mode else 'Static Message'}")
+            task = db_get_task(t_id)
+            status_desc = get_task_status_text(task)
+            buttons = get_task_control_buttons_telethon(task)
+            await event.edit(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
+
+        elif data.startswith("gm_tasktglmix_"):
+            t_id = int(parts[-1])
+            task = db_get_task(t_id)
+            new_mix = 0 if task[10] else 1
+            db_update_task(t_id, "media_mix", new_mix)
+            await event.answer(f"Mix Mode toggled to {'ON' if new_mix else 'OFF'}")
+            task = db_get_task(t_id)
+            status_desc = get_task_status_text(task)
+            buttons = get_task_control_buttons_telethon(task)
+            await event.edit(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
 
         elif data.startswith("gm_tpage_"):
             t_id = int(parts[2])
@@ -1962,6 +2570,28 @@ def setup_group_mailer_handlers(client):
             await show_task_groups_page_telethon_helper(client, event, t_id, page)
             await event.answer()
 
+        elif data.startswith("gm_tsrc_"):
+            t_id = int(parts[2])
+            g_id = int(parts[3])
+            page = int(parts[4])
+            
+            task = db_get_task(t_id)
+            selected_sources = json.loads(task[8] or "[]")
+            if g_id in selected_sources:
+                selected_sources.remove(g_id)
+            else:
+                selected_sources.append(g_id)
+                
+            db_update_task(t_id, "media_sources", json.dumps(selected_sources))
+            await show_task_sources_page_telethon_helper(client, event, t_id, page)
+            await event.answer()
+
+        elif data.startswith("gm_tsrcpage_"):
+            t_id = int(parts[2])
+            page = int(parts[3])
+            await show_task_sources_page_telethon_helper(client, event, t_id, page)
+            await event.answer()
+
         elif data.startswith("gm_tselall_"):
             t_id = int(parts[2])
             page = int(parts[3])
@@ -1976,12 +2606,33 @@ def setup_group_mailer_handlers(client):
             await show_task_groups_page_telethon_helper(client, event, t_id, page)
             await event.answer("Selected all groups!")
 
+        elif data.startswith("gm_tsrcselall_"):
+            t_id = int(parts[2])
+            page = int(parts[3])
+            task = db_get_task(t_id)
+            selected_ubs = json.loads(task[2] or "[]")
+            primary_ub = str(selected_ubs[0])
+            groups = userbot_groups_cache.get(primary_ub, [])
+            selected_sources = set(json.loads(task[8] or "[]"))
+            for g in groups:
+                selected_sources.add(g["id"])
+            db_update_task(t_id, "media_sources", json.dumps(list(selected_sources)))
+            await show_task_sources_page_telethon_helper(client, event, t_id, page)
+            await event.answer("Selected all source chats!")
+
         elif data.startswith("gm_tclrall_"):
             t_id = int(parts[2])
             page = int(parts[3])
             db_update_task(t_id, "group_ids", "[]")
             await show_task_groups_page_telethon_helper(client, event, t_id, page)
             await event.answer("Cleared selections!")
+
+        elif data.startswith("gm_tsrcclrall_"):
+            t_id = int(parts[2])
+            page = int(parts[3])
+            db_update_task(t_id, "media_sources", "[]")
+            await show_task_sources_page_telethon_helper(client, event, t_id, page)
+            await event.answer("Cleared source selections!")
 
         elif data.startswith("gm_tref_"):
             t_id = int(parts[2])
@@ -2003,6 +2654,27 @@ def setup_group_mailer_handlers(client):
                 
             await fetch_dialogs_async(target_client, primary_ub)
             await show_task_groups_page_telethon_helper(client, event, t_id, page)
+
+        elif data.startswith("gm_tsrcref_"):
+            t_id = int(parts[2])
+            page = int(parts[3])
+            task = db_get_task(t_id)
+            selected_ubs = json.loads(task[2] or "[]")
+            primary_ub = str(selected_ubs[0])
+            
+            target_client = userbot_fleet_manager.get_client(int(primary_ub))
+            if not target_client or not target_client.is_connected():
+                await event.answer("❌ Selected userbot is offline!", alert=True)
+                return
+                
+            await event.answer("🔄 Syncing source chats...")
+            await event.edit("🔄 *Syncing source chats from Telegram... Please wait...*")
+            
+            if primary_ub in userbot_groups_cache:
+                del userbot_groups_cache[primary_ub]
+                
+            await fetch_dialogs_async(target_client, primary_ub)
+            await show_task_sources_page_telethon_helper(client, event, t_id, page)
 
         elif data.startswith("gm_tsetgrp_"):
             t_id = int(parts[2])
@@ -2044,12 +2716,28 @@ def setup_group_mailer_handlers(client):
             
             task = db_get_task(t_id)
             status_desc = get_task_status_text(task)
+            buttons = get_task_control_buttons_telethon(task)
+            await event.edit(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
+
+        elif data.startswith("gm_taskmedint_"):
+            t_id = int(parts[-1])
             buttons = [
-                [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
-                [Button.inline("👥 Groups", f"gm_taskgrps_{t_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}")],
-                [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")],
-                [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
+                [Button.inline("2 Sec", f"gm_tasksetmedint_{t_id}_2"), Button.inline("5 Sec", f"gm_tasksetmedint_{t_id}_5")],
+                [Button.inline("10 Sec", f"gm_tasksetmedint_{t_id}_10"), Button.inline("15 Sec", f"gm_tasksetmedint_{t_id}_15")],
+                [Button.inline("20 Sec", f"gm_tasksetmedint_{t_id}_20"), Button.inline("30 Sec", f"gm_tasksetmedint_{t_id}_30")],
+                [Button.inline("🔙 Back", f"gm_task_view_{t_id}")]
             ]
+            await event.edit("⏱ **SELECT MEDIA INTERVAL**\nConfigure the delay in seconds between each media message being sent:", buttons=buttons)
+            await event.answer()
+
+        elif data.startswith("gm_tasksetmedint_"):
+            t_id = int(parts[2])
+            seconds = int(parts[3])
+            db_update_task(t_id, "media_interval", seconds)
+            await event.answer(f"✅ Media interval updated to {seconds}s!")
+            task = db_get_task(t_id)
+            status_desc = get_task_status_text(task)
+            buttons = get_task_control_buttons_telethon(task)
             await event.edit(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
 
         elif data.startswith("gm_taskdel_"):
