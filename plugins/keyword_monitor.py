@@ -549,14 +549,24 @@ def handle_tasks_callbacks(call):
 
         markup = InlineKeyboardMarkup(row_width=1)
         for client in connected_clients:
-            c_id = client._me.id
+            c_id = None
+            for uid_key, client_val in userbot_fleet_manager.clients.items():
+                if client_val is client:
+                    c_id = uid_key
+                    break
+            if not c_id:
+                c_id = client._me.id if hasattr(client, '_me') and client._me else None
+            if not c_id:
+                continue
+                
             is_selected = c_id in selected_ubs
             checkbox = "✅" if is_selected else "⬜"
             
-            first_name = client._me.first_name if hasattr(client, '_me') and client._me else "Userbot"
-            username = f"@{client._me.username}" if hasattr(client, '_me') and client._me and client._me.username else ""
+            me = getattr(client, '_me', None)
+            first_name = me.first_name if me else "Userbot"
+            username = f" @{me.username}" if (me and me.username) else f" (ID: {c_id})"
             
-            markup.add(InlineKeyboardButton(f"{checkbox} {first_name} {username}", callback_data=f"gm_tasktglub_{t_id}_{c_id}"))
+            markup.add(InlineKeyboardButton(f"{checkbox} {first_name}{username}", callback_data=f"gm_tasktglub_{t_id}_{c_id}"))
         
         markup.add(InlineKeyboardButton("🔙 Done / Back", callback_data=f"gm_task_view_{t_id}"))
         bot.edit_message_text(
@@ -2414,12 +2424,24 @@ def setup_group_mailer_handlers(client):
 
             buttons = []
             for cl in connected_clients:
-                c_id = cl._me.id
+                c_id = None
+                for uid_key, client_val in userbot_fleet_manager.clients.items():
+                    if client_val is cl:
+                        c_id = uid_key
+                        break
+                if not c_id:
+                    c_id = cl._me.id if hasattr(cl, '_me') and cl._me else None
+                if not c_id:
+                    continue
+                    
                 is_selected = c_id in selected_ubs
                 checkbox = "✅" if is_selected else "⬜"
-                first_name = cl._me.first_name if hasattr(cl, '_me') and cl._me else "Userbot"
-                username = f"@{cl._me.username}" if hasattr(cl, '_me') and cl._me and cl._me.username else ""
-                buttons.append([Button.inline(f"{checkbox} {first_name} {username}", f"gm_tasktglub_{t_id}_{c_id}")])
+                
+                me = getattr(cl, '_me', None)
+                first_name = me.first_name if me else "Userbot"
+                username = f" @{me.username}" if (me and me.username) else f" (ID: {c_id})"
+                
+                buttons.append([Button.inline(f"{checkbox} {first_name}{username}", f"gm_tasktglub_{t_id}_{c_id}")])
             
             buttons.append([Button.inline("🔙 Done / Back", f"gm_task_view_{t_id}")])
             await event.edit(f"👤 **Select Userbots for task `{task[1]}` (Multiple selection enabled):**", buttons=buttons)
@@ -2445,12 +2467,22 @@ def setup_group_mailer_handlers(client):
             connected_clients = [c for c in clients if c.is_connected()]
             buttons = []
             for cl in connected_clients:
-                c_id = cl._me.id
+                c_id = None
+                for uid_key, client_val in userbot_fleet_manager.clients.items():
+                    if client_val is cl:
+                        c_id = uid_key
+                        break
+                if not c_id:
+                    c_id = cl._me.id if hasattr(cl, '_me') and cl._me else None
+                if not c_id:
+                    continue
                 is_selected = c_id in selected_ubs
                 checkbox = "✅" if is_selected else "⬜"
-                first_name = cl._me.first_name if hasattr(cl, '_me') and cl._me else "Userbot"
-                username = f"@{cl._me.username}" if hasattr(cl, '_me') and cl._me and cl._me.username else ""
-                buttons.append([Button.inline(f"{checkbox} {first_name} {username}", f"gm_tasktglub_{t_id}_{c_id}")])
+                
+                me = getattr(cl, '_me', None)
+                first_name = me.first_name if me else "Userbot"
+                username = f" @{me.username}" if (me and me.username) else f" (ID: {c_id})"
+                buttons.append([Button.inline(f"{checkbox} {first_name}{username}", f"gm_tasktglub_{t_id}_{c_id}")])
             buttons.append([Button.inline("🔙 Done / Back", f"gm_task_view_{t_id}")])
             await event.edit(f"👤 **Select Userbots for task `{task[1]}` (Multiple selection enabled):**", buttons=buttons)
 
