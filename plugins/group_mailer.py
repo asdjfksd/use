@@ -204,15 +204,24 @@ if get_dashboard_markup.__name__ != "new_get_dashboard_markup":
 
     def new_get_dashboard_markup():
         markup = original_get_dashboard_markup()
-        # Prevent duplicate buttons inside the markup
-        already_has_button = False
+        # Deduplicate all buttons inside the markup to prevent any double-wrapping/plugins conflicts
+        seen_callbacks = set()
+        unique_rows = []
         if hasattr(markup, 'keyboard') and markup.keyboard:
             for row in markup.keyboard:
+                new_row = []
                 for btn in row:
-                    if getattr(btn, 'callback_data', None) == "gm_tasks_main":
-                        already_has_button = True
-                        break
-        if not already_has_button:
+                    cb = getattr(btn, 'callback_data', None)
+                    if cb:
+                        if cb in seen_callbacks:
+                            continue
+                        seen_callbacks.add(cb)
+                    new_row.append(btn)
+                if new_row:
+                    unique_rows.append(new_row)
+            markup.keyboard = unique_rows
+            
+        if "gm_tasks_main" not in seen_callbacks:
             markup.add(InlineKeyboardButton("📬 Group Mailer Tasks", callback_data="gm_tasks_main"))
         return markup
 
@@ -1271,19 +1280,44 @@ async def run_task_broadcast(task_id, is_auto=False):
                     pass
                 
             # Fetch media messages from all sources
-            media_items = []
+            sources_media = {}
             for src_id in selected_sources:
                 if not active_broadcasts.get(task_id):
                     break
                 try:
+                    group_media = []
                     async for msg in client.iter_messages(src_id, limit=30):
                         if not active_broadcasts.get(task_id):
                             break
                         if msg.media:
-                            media_items.append(msg)
+                            group_media.append(msg)
+                    if group_media:
+                        if media_mix:
+                            random.shuffle(group_media)
+                        sources_media[src_id] = group_media
                 except Exception as e:
                     logger.error(f"Error fetching media from {src_id}: {e}")
                     
+            media_items = []
+            if sources_media:
+                if media_mix:
+                    # Balanced round-robin interleaving with randomized group order per round
+                    active_sources = list(sources_media.keys())
+                    while active_sources:
+                        random.shuffle(active_sources)
+                        next_sources = []
+                        for src_id in active_sources:
+                            if sources_media[src_id]:
+                                media_items.append(sources_media[src_id].pop(0))
+                                if sources_media[src_id]:
+                                    next_sources.append(src_id)
+                        active_sources = next_sources
+                else:
+                    # Sequential merge if mix is off (Group A, then Group B, etc.)
+                    for src_id in selected_sources:
+                        if src_id in sources_media:
+                            media_items.extend(sources_media[src_id])
+                
             if not media_items:
                 if dest_chat:
                     try:
@@ -1291,9 +1325,6 @@ async def run_task_broadcast(task_id, is_auto=False):
                     except Exception:
                         pass
                 return
-                
-            if media_mix:
-                random.shuffle(media_items)
                 
             total_media = len(media_items)
             total_targets = len(selected_groups)
