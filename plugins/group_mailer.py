@@ -42,6 +42,9 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 # In-memory cache for userbot groups
 userbot_groups_cache = {}
 
+# Track currently running task broadcasts
+active_broadcasts = {}
+
 # Initialize database schema for task-based mailer
 def init_plugin_db():
     try:
@@ -95,15 +98,21 @@ init_plugin_db()
 def db_create_task(name):
     with main_module.db_conn() as conn:
         c = conn.cursor()
-        c.execute(
-            "INSERT INTO gm_tasks (name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (name, "[]", "[]", "{}", 0, 0.0, "")
-        ) if not main_module.USING_POSTGRES else c.execute(
-            "INSERT INTO gm_tasks (name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (name, "[]", "[]", "{}", 0, 0.0, "")
-        )
-        conn.commit()
-        return c.lastrowid
+        if main_module.USING_POSTGRES:
+            c.execute(
+                "INSERT INTO gm_tasks (name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (name, "[]", "[]", "{}", 0, 0.0, "")
+            )
+            inserted_id = c.fetchone()[0]
+            conn.commit()
+            return inserted_id
+        else:
+            c.execute(
+                "INSERT INTO gm_tasks (name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name, "[]", "[]", "{}", 0, 0.0, "")
+            )
+            conn.commit()
+            return c.lastrowid
 
 def db_get_tasks():
     with main_module.db_conn() as conn:
@@ -259,8 +268,12 @@ def get_task_status_text(task):
     mode_lbl = "🖼 Fetch Media from Sources" if media_enabled else "💬 Send Static Message"
     mix_lbl = "🟢 Activated" if media_mix else "🔴 Deactivated"
     
+    is_running = active_broadcasts.get(t_id, False)
+    run_status = "🟢 Running" if is_running else "🔴 Idle"
+    
     status_text = (
         f"📋 *Task Name:* `{name}` (ID: `{t_id}`)\n"
+        f"⚡ *Campaign Status:* `{run_status}`\n"
         f"👤 *Selected Userbots:* {ub_status}\n"
         f"⚙️ *Mailer Mode:* `{mode_lbl}`\n"
     )
@@ -288,38 +301,53 @@ def get_task_control_markup(task):
     media_mix = task[10]
     
     markup = InlineKeyboardMarkup()
-    
-    # Row 1: Select Userbots, Select Msg
-    markup.row(
-        InlineKeyboardButton("👤 Select Userbots", callback_data=f"gm_taskubs_{t_id}"),
-        InlineKeyboardButton("💬 Select Msg", callback_data=f"gm_taskmsg_{t_id}")
-    )
-    
-    # Row 2: Target Groups, Repeat Interval
-    markup.row(
-        InlineKeyboardButton("👥 Target Groups", callback_data=f"gm_taskgrps_{t_id}"),
-        InlineKeyboardButton("⏰ Repeat Interval", callback_data=f"gm_taskrep_{t_id}")
-    )
-    
-    # Row 3: Mode Toggle, Mix Toggle
     mode_btn_text = "🖼 Mode: Fetch Media" if media_enabled else "💬 Mode: Static Msg"
-    mix_btn_text = "🔀 Mix: ON" if media_mix else "🔀 Mix: OFF"
+    
+    if media_enabled:
+        # Row 1: Select Userbots, Target Groups
+        markup.row(
+            InlineKeyboardButton("👤 Select Userbots", callback_data=f"gm_taskubs_{t_id}"),
+            InlineKeyboardButton("👥 Target Groups", callback_data=f"gm_taskgrps_{t_id}")
+        )
+        # Row 2: Source Chats, Media Interval
+        markup.row(
+            InlineKeyboardButton("📥 Source Chats", callback_data=f"gm_tasksrcgrps_{t_id}"),
+            InlineKeyboardButton("⏱ Media Interval", callback_data=f"gm_taskmedint_{t_id}")
+        )
+        # Row 3: Mode Toggle, Mix Toggle
+        mix_btn_text = "🔀 Mix: ON" if media_mix else "🔀 Mix: OFF"
+        markup.row(
+            InlineKeyboardButton(mode_btn_text, callback_data=f"gm_tasktglmode_{t_id}"),
+            InlineKeyboardButton(mix_btn_text, callback_data=f"gm_tasktglmix_{t_id}")
+        )
+    else:
+        # Row 1: Select Userbots, Select Msg
+        markup.row(
+            InlineKeyboardButton("👤 Select Userbots", callback_data=f"gm_taskubs_{t_id}"),
+            InlineKeyboardButton("💬 Select Msg", callback_data=f"gm_taskmsg_{t_id}")
+        )
+        # Row 2: Target Groups, Mode Toggle
+        markup.row(
+            InlineKeyboardButton("👥 Target Groups", callback_data=f"gm_taskgrps_{t_id}"),
+            InlineKeyboardButton(mode_btn_text, callback_data=f"gm_tasktglmode_{t_id}")
+        )
+        
+    # Row 4: Repeat Interval, Import Links
     markup.row(
-        InlineKeyboardButton(mode_btn_text, callback_data=f"gm_tasktglmode_{t_id}"),
-        InlineKeyboardButton(mix_btn_text, callback_data=f"gm_tasktglmix_{t_id}")
+        InlineKeyboardButton("⏰ Repeat Interval", callback_data=f"gm_taskrep_{t_id}"),
+        InlineKeyboardButton("🔗 Import Join Links", callback_data=f"gm_tasklinks_{t_id}")
     )
     
-    # Row 4: Source Chats, Media Interval
-    markup.row(
-        InlineKeyboardButton("📥 Source Chats", callback_data=f"gm_tasksrcgrps_{t_id}"),
-        InlineKeyboardButton("⏱ Media Interval", callback_data=f"gm_taskmedint_{t_id}")
-    )
-    
-    # Row 5: Import Links, Start Operation
-    markup.row(
-        InlineKeyboardButton("🔗 Import Join Links", callback_data=f"gm_tasklinks_{t_id}"),
-        InlineKeyboardButton("🚀 Start Operation", callback_data=f"gm_taskstart_{t_id}")
-    )
+    # Row 5: Start / Stop Operation
+    is_running = active_broadcasts.get(t_id, False)
+    if is_running:
+        markup.row(
+            InlineKeyboardButton("🛑 Stop Operation", callback_data=f"gm_taskstop_{t_id}")
+        )
+    else:
+        markup.row(
+            InlineKeyboardButton("🚀 Start Operation", callback_data=f"gm_taskstart_{t_id}")
+        )
     
     # Row 6: Delete Task, Back to list
     markup.row(
@@ -335,16 +363,28 @@ def get_task_control_buttons_telethon(task):
     
     from telethon import Button
     mode_btn_text = "🖼 Mode: Fetch Media" if media_enabled else "💬 Mode: Static Msg"
-    mix_btn_text = "🔀 Mix: ON" if media_mix else "🔀 Mix: OFF"
     
-    return [
-        [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
-        [Button.inline("👥 Target Groups", f"gm_taskgrps_{t_id}"), Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}")],
-        [Button.inline(mode_btn_text, f"gm_tasktglmode_{t_id}"), Button.inline(mix_btn_text, f"gm_tasktglmix_{t_id}")],
-        [Button.inline("📥 Source Chats", f"gm_tasksrcgrps_{t_id}"), Button.inline("⏱ Media Interval", f"gm_taskmedint_{t_id}")],
-        [Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}"), Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")],
-        [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
-    ]
+    is_running = active_broadcasts.get(t_id, False)
+    op_button = Button.inline("🛑 Stop Operation", f"gm_taskstop_{t_id}") if is_running else Button.inline("🚀 Start Operation", f"gm_taskstart_{t_id}")
+    
+    if media_enabled:
+        mix_btn_text = "🔀 Mix: ON" if media_mix else "🔀 Mix: OFF"
+        return [
+            [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("👥 Target Groups", f"gm_taskgrps_{t_id}")],
+            [Button.inline("📥 Source Chats", f"gm_tasksrcgrps_{t_id}"), Button.inline("⏱ Media Interval", f"gm_taskmedint_{t_id}")],
+            [Button.inline(mode_btn_text, f"gm_tasktglmode_{t_id}"), Button.inline(mix_btn_text, f"gm_tasktglmix_{t_id}")],
+            [Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}"), Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}")],
+            [op_button],
+            [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
+        ]
+    else:
+        return [
+            [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("💬 Select Msg", f"gm_taskmsg_{t_id}")],
+            [Button.inline("👥 Target Groups", f"gm_taskgrps_{t_id}"), Button.inline(mode_btn_text, f"gm_tasktglmode_{t_id}")],
+            [Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}"), Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}")],
+            [op_button],
+            [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
+        ]
 
 # Helper to render the interactive groups checklist page for a specific task
 def show_task_groups_page(chat_id, message_id, task_id, ub_id, page=0):
@@ -792,6 +832,8 @@ def handle_tasks_callbacks(call):
         selected_ubs = json.loads(task[2] or "[]")
         selected_groups = json.loads(task[3] or "[]")
         msg_data = json.loads(task[4] or "{}")
+        media_sources = json.loads(task[8] or "[]")
+        media_enabled = task[11]
 
         if not selected_ubs:
             bot.answer_callback_query(call.id, "❌ Please select at least one Userbot first!", show_alert=True)
@@ -799,15 +841,27 @@ def handle_tasks_callbacks(call):
         if not selected_groups:
             bot.answer_callback_query(call.id, "❌ Please select target groups first!", show_alert=True)
             return
-        if not msg_data:
-            bot.answer_callback_query(call.id, "❌ Please set the mailer message first!", show_alert=True)
-            return
+            
+        if media_enabled:
+            if not media_sources:
+                bot.answer_callback_query(call.id, "❌ Please select media source chats first!", show_alert=True)
+                return
+        else:
+            if not msg_data:
+                bot.answer_callback_query(call.id, "❌ Please set the mailer message first!", show_alert=True)
+                return
 
         bot.answer_callback_query(call.id, "🚀 Starting campaign operation...")
         asyncio.run_coroutine_threadsafe(
             run_task_broadcast(t_id),
             loop
         )
+
+    elif data.startswith("gm_taskstop_"):
+        t_id = int(data.split("_")[-1])
+        active_broadcasts[t_id] = False
+        bot.answer_callback_query(call.id, "🛑 Stopping campaign operation...")
+        handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_task_view_{t_id}", 'message': call.message, 'id': call.id})())
 
 # Catch-all sub-handlers for page navigations and toggles on tasks
 @bot.callback_query_handler(func=lambda call: call.data.startswith("gm_t"))
@@ -1182,351 +1236,365 @@ async def run_task_broadcast(task_id, is_auto=False):
     if not ub_ids or not selected_groups:
         return
 
-    # Use primary userbot to resolve entities/join links and manage log messages
-    primary_ub = ub_ids[0]
-    client = userbot_fleet_manager.get_client(int(primary_ub))
-    if not client or not client.is_connected():
-        if dest_chat:
-            try:
-                bot.send_message(dest_chat, f"❌ *{label} Failed:* Primary userbot is offline.")
-            except Exception:
-                pass
-        return
+    active_broadcasts[task_id] = True
+    try:
+        # Use primary userbot to resolve entities/join links and manage log messages
+        primary_ub = ub_ids[0]
+        client = userbot_fleet_manager.get_client(int(primary_ub))
+        if not client or not client.is_connected():
+            if dest_chat:
+                try:
+                    bot.send_message(dest_chat, f"❌ *{label} Failed:* Primary userbot is offline.")
+                except Exception:
+                    pass
+            return
 
-    links_map = db_get_links_map()
-    failed_details = []
-    
-    if media_enabled:
-        # --- MEDIA MODE ---
-        selected_sources = json.loads(media_sources_raw or "[]")
-        if not selected_sources:
-            if dest_chat:
-                try:
-                    bot.send_message(dest_chat, f"❌ *{label} Failed:* No media sources configured.")
-                except Exception:
-                    pass
-            return
-            
-        progress_msg = None
-        if dest_chat:
-            try:
-                progress_msg = bot.send_message(dest_chat, f"⏳ *{label}:* Fetching media from sources...", parse_mode="Markdown")
-            except Exception:
-                pass
-            
-        # Fetch media messages from all sources
-        media_items = []
-        for src_id in selected_sources:
-            try:
-                async for msg in client.iter_messages(src_id, limit=30):
-                    if msg.media:
-                        media_items.append(msg)
-            except Exception as e:
-                logger.error(f"Error fetching media from {src_id}: {e}")
-                
-        if not media_items:
-            if dest_chat:
-                try:
-                    bot.send_message(dest_chat, f"❌ *{label} Completed:* No media messages found in source groups.", parse_mode="Markdown")
-                except Exception:
-                    pass
-            return
-            
-        if media_mix:
-            random.shuffle(media_items)
-            
-        total_media = len(media_items)
-        total_targets = len(selected_groups)
+        links_map = db_get_links_map()
+        failed_details = []
         
-        for idx, msg in enumerate(media_items):
-            # Re-fetch task dynamically on every loop step
-            live_task = db_get_task(task_id)
-            if not live_task:
-                break
+        if media_enabled:
+            # --- MEDIA MODE ---
+            selected_sources = json.loads(media_sources_raw or "[]")
+            if not selected_sources:
+                if dest_chat:
+                    try:
+                        bot.send_message(dest_chat, f"❌ *{label} Failed:* No media sources configured.")
+                    except Exception:
+                        pass
+                return
                 
-            for t_idx, group_id in enumerate(selected_groups):
+            progress_msg = None
+            if dest_chat:
+                try:
+                    progress_msg = bot.send_message(dest_chat, f"⏳ *{label}:* Fetching media from sources...", parse_mode="Markdown")
+                except Exception:
+                    pass
+                
+            # Fetch media messages from all sources
+            media_items = []
+            for src_id in selected_sources:
+                if not active_broadcasts.get(task_id):
+                    break
+                try:
+                    async for msg in client.iter_messages(src_id, limit=30):
+                        if not active_broadcasts.get(task_id):
+                            break
+                        if msg.media:
+                            media_items.append(msg)
+                except Exception as e:
+                    logger.error(f"Error fetching media from {src_id}: {e}")
+                    
+            if not media_items:
+                if dest_chat:
+                    try:
+                        bot.send_message(dest_chat, f"❌ *{label} Completed:* No media messages found in source groups.", parse_mode="Markdown")
+                    except Exception:
+                        pass
+                return
+                
+            if media_mix:
+                random.shuffle(media_items)
+                
+            total_media = len(media_items)
+            total_targets = len(selected_groups)
+            
+            for idx, msg in enumerate(media_items):
+                # Re-fetch task dynamically on every loop step
+                live_task = db_get_task(task_id)
+                if not live_task or not active_broadcasts.get(task_id):
+                    break
+                    
+                for t_idx, group_id in enumerate(selected_groups):
+                    if not active_broadcasts.get(task_id):
+                        break
+                    group_sent_successfully = False
+                    group_errors = []
+                    
+                    # Failover through configured userbots
+                    for ub_id in ub_ids:
+                        if not active_broadcasts.get(task_id):
+                            break
+                        ub_client = userbot_fleet_manager.get_client(int(ub_id))
+                        if not ub_client or not ub_client.is_connected():
+                            group_errors.append((ub_id, "Userbot offline"))
+                            continue
+                            
+                        try:
+                            entity = group_id
+                            try:
+                                if isinstance(group_id, str) and group_id.startswith("@"):
+                                    entity = await ub_client.get_entity(group_id)
+                                elif isinstance(group_id, str) and group_id.isdigit():
+                                    entity = int(group_id)
+                            except Exception as ent_err:
+                                join_link = links_map.get(str(group_id))
+                                if join_link:
+                                    try:
+                                        await join_group_via_client(ub_client, join_link)
+                                        await asyncio.sleep(random.randint(5, 10))
+                                        entity = group_id
+                                        if isinstance(group_id, str) and group_id.startswith("@"):
+                                            entity = await ub_client.get_entity(group_id)
+                                        elif isinstance(group_id, str) and group_id.isdigit():
+                                            entity = int(group_id)
+                                    except Exception as join_err:
+                                        raise Exception(f"Auto-join failed: {join_err}")
+                                else:
+                                    raise ent_err
+                                    
+                            # Try direct send by file reference first
+                            try:
+                                await ub_client.send_file(entity, msg.media, caption=msg.message)
+                            except Exception as send_err:
+                                # Fallback: Download locally and upload/send
+                                temp_file = await ub_client.download_media(msg)
+                                if temp_file:
+                                    await ub_client.send_file(entity, temp_file, caption=msg.message)
+                                    try:
+                                        os.remove(temp_file)
+                                    except Exception:
+                                        pass
+                                else:
+                                    raise send_err
+                                    
+                            group_sent_successfully = True
+                            break
+                        except Exception as e:
+                            try:
+                                # Retry auto-join check
+                                join_link = links_map.get(str(group_id))
+                                if join_link and "auto-join failed" not in str(e).lower():
+                                    await join_group_via_client(ub_client, join_link)
+                                    await asyncio.sleep(random.randint(5, 10))
+                                    try:
+                                        await ub_client.send_file(entity, msg.media, caption=msg.message)
+                                    except Exception as inner_send_err:
+                                        temp_file = await ub_client.download_media(msg)
+                                        if temp_file:
+                                            await ub_client.send_file(entity, temp_file, caption=msg.message)
+                                            try: os.remove(temp_file)
+                                            except Exception: pass
+                                        else:
+                                            raise inner_send_err
+                                    group_sent_successfully = True
+                                    break
+                            except Exception as retry_err:
+                                e = retry_err
+                            group_errors.append((ub_id, e))
+                            
+                    if group_sent_successfully:
+                        success += 1
+                    else:
+                        failed += 1
+                        report_lines = [f"❌ *Media {idx+1} to Target ID:* `{group_id}`"]
+                        for ub_id, err in group_errors:
+                            report_lines.append(f"  ⚠️ *UB {ub_id}:* {get_friendly_error(err)}")
+                        failed_details.append("\n".join(report_lines))
+                        
+                    # Update progress
+                    if progress_msg and dest_chat:
+                        try:
+                            pct = int((((idx * total_targets) + (t_idx + 1)) / (total_media * total_targets)) * 100)
+                            bot.edit_message_text(
+                                chat_id=dest_chat,
+                                message_id=progress_msg.message_id,
+                                text=(
+                                    f"⏳ *{label} (Media Mode):* `{pct}%` Done\n"
+                                    f"📷 Media: `{idx+1}/{total_media}` | Target: `{t_idx+1}/{total_targets}`\n"
+                                    f"🟢 Success: `{success}` | 🔴 Failed: `{failed}`"
+                                ),
+                                parse_mode="Markdown"
+                            )
+                        except Exception:
+                            pass
+                            
+                    # Small delay between target groups to prevent flooding
+                    await asyncio.sleep(2)
+                    
+                # Wait configured interval between sending each media item
+                await asyncio.sleep(media_interval)
+                
+            if dest_chat:
+                try:
+                    bot.send_message(
+                        dest_chat,
+                        f"✅ *{label} (Media Mode) Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+                    
+            # Send failure details
+            if failed_details and dest_chat:
+                try:
+                    header = f"🚨 *{label} Failure Report (Media Mode):*\n\n"
+                    current_message = header
+                    for report in failed_details:
+                        if len(current_message) + len(report) + 2 > 4000:
+                            bot.send_message(dest_chat, current_message, parse_mode="Markdown")
+                            current_message = ""
+                        current_message += report + "\n\n"
+                    if current_message.strip():
+                        bot.send_message(dest_chat, current_message, parse_mode="Markdown")
+                except Exception as e:
+                    logger.error(f"Error sending failure report: {e}")
+                    
+        else:
+            # --- ORIGINAL STATIC MESSAGE MODE ---
+            progress_msg = None
+            if dest_chat:
+                try:
+                    progress_msg = bot.send_message(dest_chat, f"⏳ *{label} progress:* `0%`", parse_mode="Markdown")
+                except Exception as err:
+                    logger.error(f"Failed to send task progress updates to {dest_chat}: {err}")
+
+            sent_group_ids = set()
+            
+            # Pre-load group titles from local cache
+            group_titles = {}
+            for ub_id in ub_ids:
+                for g in userbot_groups_cache.get(str(ub_id), []):
+                    group_titles[g["id"]] = g["title"]
+
+            while True:
+                # Re-fetch task to load live group ids dynamically on every loop step
+                live_task = db_get_task(task_id)
+                if not live_task or not active_broadcasts.get(task_id):
+                    break
+                    
+                live_group_ids = json.loads(live_task[3] or "[]")
+                
+                remaining_groups = [g for g in live_group_ids if g not in sent_group_ids]
+                if not remaining_groups:
+                    break
+                    
+                group_id = remaining_groups[0]
+                sent_group_ids.add(group_id)
+                
                 group_sent_successfully = False
                 group_errors = []
-                
-                # Failover through configured userbots
+
+                # Iterate over all selected userbots
                 for ub_id in ub_ids:
-                    ub_client = userbot_fleet_manager.get_client(int(ub_id))
-                    if not ub_client or not ub_client.is_connected():
+                    if not active_broadcasts.get(task_id):
+                        break
+                    client = userbot_fleet_manager.get_client(int(ub_id))
+                    if not client or not client.is_connected():
                         group_errors.append((ub_id, "Userbot offline"))
                         continue
-                        
+
                     try:
                         entity = group_id
                         try:
                             if isinstance(group_id, str) and group_id.startswith("@"):
-                                entity = await ub_client.get_entity(group_id)
+                                entity = await client.get_entity(group_id)
                             elif isinstance(group_id, str) and group_id.isdigit():
                                 entity = int(group_id)
                         except Exception as ent_err:
                             join_link = links_map.get(str(group_id))
                             if join_link:
                                 try:
-                                    await join_group_via_client(ub_client, join_link)
-                                    await asyncio.sleep(random.randint(5, 10))
+                                    await join_group_via_client(client, join_link)
+                                    join_wait = random.randint(5, 10)
+                                    await asyncio.sleep(join_wait)
                                     entity = group_id
                                     if isinstance(group_id, str) and group_id.startswith("@"):
-                                        entity = await ub_client.get_entity(group_id)
+                                        entity = await client.get_entity(group_id)
                                     elif isinstance(group_id, str) and group_id.isdigit():
                                         entity = int(group_id)
                                 except Exception as join_err:
                                     raise Exception(f"Auto-join failed: {join_err}")
                             else:
                                 raise ent_err
-                                
-                        # Try direct send by file reference first
-                        try:
-                            await ub_client.send_file(entity, msg.media, caption=msg.message)
-                        except Exception as send_err:
-                            # Fallback: Download locally and upload/send
-                            temp_file = await ub_client.download_media(msg)
-                            if temp_file:
-                                await ub_client.send_file(entity, temp_file, caption=msg.message)
-                                try:
-                                    os.remove(temp_file)
-                                except Exception:
-                                    pass
-                            else:
-                                raise send_err
-                                
+
+                        # Send
+                        msg_type = msg_data.get("type")
+                        if msg_type == "text":
+                            await client.send_message(entity, msg_data["text"])
+                        elif msg_type in ["photo", "video", "document"]:
+                            await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
+                        
                         group_sent_successfully = True
                         break
                     except Exception as e:
                         try:
-                            # Retry auto-join check
                             join_link = links_map.get(str(group_id))
                             if join_link and "auto-join failed" not in str(e).lower():
-                                await join_group_via_client(ub_client, join_link)
-                                await asyncio.sleep(random.randint(5, 10))
-                                try:
-                                    await ub_client.send_file(entity, msg.media, caption=msg.message)
-                                except Exception as inner_send_err:
-                                    temp_file = await ub_client.download_media(msg)
-                                    if temp_file:
-                                        await ub_client.send_file(entity, temp_file, caption=msg.message)
-                                        try: os.remove(temp_file)
-                                        except Exception: pass
-                                    else:
-                                        raise inner_send_err
+                                await join_group_via_client(client, join_link)
+                                join_wait = random.randint(5, 10)
+                                await asyncio.sleep(join_wait)
+                                
+                                msg_type = msg_data.get("type")
+                                if msg_type == "text":
+                                    await client.send_message(entity, msg_data["text"])
+                                elif msg_type in ["photo", "video", "document"]:
+                                    await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
+                                
                                 group_sent_successfully = True
                                 break
                         except Exception as retry_err:
                             e = retry_err
-                        group_errors.append((ub_id, e))
                         
+                        group_errors.append((ub_id, e))
+                        logger.warning(f"Userbot {ub_id} failed to send to {group_id} under Task {task_id}: {e}")
+                
                 if group_sent_successfully:
                     success += 1
                 else:
                     failed += 1
-                    report_lines = [f"❌ *Media {idx+1} to Target ID:* `{group_id}`"]
+                    g_title = group_titles.get(group_id, f"ID: {group_id}")
+                    report_lines = [f"❌ *Group:* `{g_title}`"]
                     for ub_id, err in group_errors:
                         report_lines.append(f"  ⚠️ *UB {ub_id}:* {get_friendly_error(err)}")
                     failed_details.append("\n".join(report_lines))
-                    
-                # Update progress
-                if progress_msg and dest_chat:
+
+                # Live progress update
+                total_groups = len(live_group_ids)
+                processed_count = len(sent_group_ids)
+                
+                if progress_msg and dest_chat and (processed_count % 3 == 0 or processed_count == total_groups):
+                    pct = int((processed_count / max(1, total_groups)) * 100)
                     try:
-                        pct = int((((idx * total_targets) + (t_idx + 1)) / (total_media * total_targets)) * 100)
                         bot.edit_message_text(
                             chat_id=dest_chat,
                             message_id=progress_msg.message_id,
-                            text=(
-                                f"⏳ *{label} (Media Mode):* `{pct}%` Done\n"
-                                f"📷 Media: `{idx+1}/{total_media}` | Target: `{t_idx+1}/{total_targets}`\n"
-                                f"🟢 Success: `{success}` | 🔴 Failed: `{failed}`"
-                            ),
+                            text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}` | Total: `{total_groups}`)",
                             parse_mode="Markdown"
                         )
                     except Exception:
                         pass
-                        
-                # Small delay between target groups to prevent flooding
-                await asyncio.sleep(2)
-                
-            # Wait configured interval between sending each media item
-            await asyncio.sleep(media_interval)
-            
-        if dest_chat:
-            try:
-                bot.send_message(
-                    dest_chat,
-                    f"✅ *{label} (Media Mode) Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-                
-        # Send failure details
-        if failed_details and dest_chat:
-            try:
-                header = f"🚨 *{label} Failure Report (Media Mode):*\n\n"
-                current_message = header
-                for report in failed_details:
-                    if len(current_message) + len(report) + 2 > 4000:
-                        bot.send_message(dest_chat, current_message, parse_mode="Markdown")
-                        current_message = ""
-                    current_message += report + "\n\n"
-                if current_message.strip():
-                    bot.send_message(dest_chat, current_message, parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Error sending failure report: {e}")
-                
-    else:
-        # --- ORIGINAL STATIC MESSAGE MODE ---
-        progress_msg = None
-        if dest_chat:
-            try:
-                progress_msg = bot.send_message(dest_chat, f"⏳ *{label} progress:* `0%`", parse_mode="Markdown")
-            except Exception as err:
-                logger.error(f"Failed to send task progress updates to {dest_chat}: {err}")
 
-        sent_group_ids = set()
-        
-        # Pre-load group titles from local cache
-        group_titles = {}
-        for ub_id in ub_ids:
-            for g in userbot_groups_cache.get(str(ub_id), []):
-                group_titles[g["id"]] = g["title"]
+                # Random delay between 5 to 10 seconds
+                await asyncio.sleep(random.randint(5, 10))
 
-        while True:
-            # Re-fetch task to load live group ids dynamically on every loop step
-            live_task = db_get_task(task_id)
-            if not live_task:
-                break
-                
-            live_group_ids = json.loads(live_task[3] or "[]")
-            
-            remaining_groups = [g for g in live_group_ids if g not in sent_group_ids]
-            if not remaining_groups:
-                break
-                
-            group_id = remaining_groups[0]
-            sent_group_ids.add(group_id)
-            
-            group_sent_successfully = False
-            group_errors = []
-
-            # Iterate over all selected userbots
-            for ub_id in ub_ids:
-                client = userbot_fleet_manager.get_client(int(ub_id))
-                if not client or not client.is_connected():
-                    group_errors.append((ub_id, "Userbot offline"))
-                    continue
-
+            if dest_chat:
                 try:
-                    entity = group_id
-                    try:
-                        if isinstance(group_id, str) and group_id.startswith("@"):
-                            entity = await client.get_entity(group_id)
-                        elif isinstance(group_id, str) and group_id.isdigit():
-                            entity = int(group_id)
-                    except Exception as ent_err:
-                        join_link = links_map.get(str(group_id))
-                        if join_link:
-                            try:
-                                await join_group_via_client(client, join_link)
-                                join_wait = random.randint(5, 10)
-                                await asyncio.sleep(join_wait)
-                                entity = group_id
-                                if isinstance(group_id, str) and group_id.startswith("@"):
-                                    entity = await client.get_entity(group_id)
-                                elif isinstance(group_id, str) and group_id.isdigit():
-                                    entity = int(group_id)
-                            except Exception as join_err:
-                                raise Exception(f"Auto-join failed: {join_err}")
-                        else:
-                            raise ent_err
-
-                    # Send
-                    msg_type = msg_data.get("type")
-                    if msg_type == "text":
-                        await client.send_message(entity, msg_data["text"])
-                    elif msg_type in ["photo", "video", "document"]:
-                        await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
-                    
-                    group_sent_successfully = True
-                    break
-                except Exception as e:
-                    try:
-                        join_link = links_map.get(str(group_id))
-                        if join_link and "auto-join failed" not in str(e).lower():
-                            await join_group_via_client(client, join_link)
-                            join_wait = random.randint(5, 10)
-                            await asyncio.sleep(join_wait)
-                            
-                            msg_type = msg_data.get("type")
-                            if msg_type == "text":
-                                await client.send_message(entity, msg_data["text"])
-                            elif msg_type in ["photo", "video", "document"]:
-                                await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
-                            
-                            group_sent_successfully = True
-                            break
-                    except Exception as retry_err:
-                        e = retry_err
-                    
-                    group_errors.append((ub_id, e))
-                    logger.warning(f"Userbot {ub_id} failed to send to {group_id} under Task {task_id}: {e}")
-            
-            if group_sent_successfully:
-                success += 1
-            else:
-                failed += 1
-                g_title = group_titles.get(group_id, f"ID: {group_id}")
-                report_lines = [f"❌ *Group:* `{g_title}`"]
-                for ub_id, err in group_errors:
-                    report_lines.append(f"  ⚠️ *UB {ub_id}:* {get_friendly_error(err)}")
-                failed_details.append("\n".join(report_lines))
-
-            # Live progress update
-            total_groups = len(live_group_ids)
-            processed_count = len(sent_group_ids)
-            
-            if progress_msg and dest_chat and (processed_count % 3 == 0 or processed_count == total_groups):
-                pct = int((processed_count / max(1, total_groups)) * 100)
-                try:
-                    bot.edit_message_text(
-                        chat_id=dest_chat,
-                        message_id=progress_msg.message_id,
-                        text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}` | Total: `{total_groups}`)",
+                    bot.send_message(
+                        dest_chat,
+                        f"✅ *{label} Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
                         parse_mode="Markdown"
                     )
                 except Exception:
                     pass
 
-            # Random delay between 5 to 10 seconds
-            await asyncio.sleep(random.randint(5, 10))
-
-        if dest_chat:
-            try:
-                bot.send_message(
-                    dest_chat,
-                    f"✅ *{label} Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-
-        # Send Detailed Failure Report
-        if failed_details and dest_chat:
-            try:
-                header = f"🚨 *{label} Failure Report:*\nThe message could not be sent to these groups on all configured accounts:\n\n"
-                current_message = header
-                
-                for report in failed_details:
-                    if len(current_message) + len(report) + 2 > 4000:
-                        bot.send_message(dest_chat, current_message, parse_mode="Markdown")
-                        current_message = ""
-                    current_message += report + "\n\n"
+            # Send Detailed Failure Report
+            if failed_details and dest_chat:
+                try:
+                    header = f"🚨 *{label} Failure Report:*\nThe message could not be sent to these groups on all configured accounts:\n\n"
+                    current_message = header
                     
-                if current_message.strip():
-                    bot.send_message(dest_chat, current_message, parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Error sending failure report: {e}")
+                    for report in failed_details:
+                        if len(current_message) + len(report) + 2 > 4000:
+                            bot.send_message(dest_chat, current_message, parse_mode="Markdown")
+                            current_message = ""
+                        current_message += report + "\n\n"
+                        
+                    if current_message.strip():
+                        bot.send_message(dest_chat, current_message, parse_mode="Markdown")
+                except Exception as e:
+                    logger.error(f"Error sending failure report: {e}")
+    finally:
+        active_broadcasts.pop(task_id, None)
 
 
 # Background Scheduled Supervisor Loop for Campaign Tasks
@@ -2767,6 +2835,8 @@ def setup_group_mailer_handlers(client):
             selected_ubs = json.loads(task[2] or "[]")
             selected_groups = json.loads(task[3] or "[]")
             msg_data = json.loads(task[4] or "{}")
+            media_sources = json.loads(task[8] or "[]")
+            media_enabled = task[11]
 
             if not selected_ubs:
                 await event.answer("❌ Please select at least one Userbot first!", alert=True)
@@ -2774,12 +2844,27 @@ def setup_group_mailer_handlers(client):
             if not selected_groups:
                 await event.answer("❌ Please select target groups first!", alert=True)
                 return
-            if not msg_data:
-                await event.answer("❌ Please set the mailer message first!", alert=True)
-                return
+                
+            if media_enabled:
+                if not media_sources:
+                    await event.answer("❌ Please select media source chats first!", alert=True)
+                    return
+            else:
+                if not msg_data:
+                    await event.answer("❌ Please set the mailer message first!", alert=True)
+                    return
 
             await event.answer("🚀 Starting campaign operation...")
             asyncio.create_task(run_task_broadcast(t_id))
+
+        elif data.startswith("gm_taskstop_"):
+            t_id = int(parts[-1])
+            active_broadcasts[t_id] = False
+            await event.answer("🛑 Stopping campaign operation...")
+            task = db_get_task(t_id)
+            status_desc = get_task_status_text(task)
+            buttons = get_task_control_buttons_telethon(task)
+            await event.edit(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
 
 # Monkeypatch setup_automation_handlers to register our custom command handlers
 original_setup_automation_handlers = main_module.setup_automation_handlers
