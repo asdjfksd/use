@@ -204,24 +204,15 @@ if get_dashboard_markup.__name__ != "new_get_dashboard_markup":
 
     def new_get_dashboard_markup():
         markup = original_get_dashboard_markup()
-        # Deduplicate all buttons inside the markup to prevent any double-wrapping/plugins conflicts
-        seen_callbacks = set()
-        unique_rows = []
+        # Prevent duplicate buttons inside the markup
+        already_has_button = False
         if hasattr(markup, 'keyboard') and markup.keyboard:
             for row in markup.keyboard:
-                new_row = []
                 for btn in row:
-                    cb = getattr(btn, 'callback_data', None)
-                    if cb:
-                        if cb in seen_callbacks:
-                            continue
-                        seen_callbacks.add(cb)
-                    new_row.append(btn)
-                if new_row:
-                    unique_rows.append(new_row)
-            markup.keyboard = unique_rows
-            
-        if "gm_tasks_main" not in seen_callbacks:
+                    if getattr(btn, 'callback_data', None) == "gm_tasks_main":
+                        already_has_button = True
+                        break
+        if not already_has_button:
             markup.add(InlineKeyboardButton("📬 Group Mailer Tasks", callback_data="gm_tasks_main"))
         return markup
 
