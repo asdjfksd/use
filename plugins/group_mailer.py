@@ -73,6 +73,16 @@ def init_plugin_db():
                     link TEXT
                 )
             """)
+            
+            # Map duplicate protection sent media history
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS gm_sent_media_history (
+                    task_id INTEGER,
+                    source_chat_id TEXT,
+                    message_id INTEGER,
+                    PRIMARY KEY (task_id, source_chat_id, message_id)
+                )
+            """)
             conn.commit()
 
             # Add migration columns for media forwarding
@@ -80,7 +90,9 @@ def init_plugin_db():
                 ("media_sources", "TEXT DEFAULT '[]'"),
                 ("media_interval", "INTEGER DEFAULT 10"),
                 ("media_mix", "INTEGER DEFAULT 0"),
-                ("media_enabled", "INTEGER DEFAULT 0")
+                ("media_enabled", "INTEGER DEFAULT 0"),
+                ("last_source_ids", "TEXT DEFAULT '{}'"),
+                ("media_dedup", "INTEGER DEFAULT 0")
             ]
             for col_name, col_def in columns_to_add:
                 try:
@@ -123,7 +135,7 @@ def db_get_tasks():
 def db_get_task(task_id):
     with main_module.db_conn() as conn:
         c = conn.cursor()
-        fields = "id, name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id, media_sources, media_interval, media_mix, media_enabled"
+        fields = "id, name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id, media_sources, media_interval, media_mix, media_enabled, last_source_ids, media_dedup"
         query = f"SELECT {fields} FROM gm_tasks WHERE id = ?" if not main_module.USING_POSTGRES else f"SELECT {fields} FROM gm_tasks WHERE id = %s"
         c.execute(query, (task_id,))
         return c.fetchone()
@@ -139,6 +151,7 @@ def db_delete_task(task_id):
     with main_module.db_conn() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM gm_tasks WHERE id = ?", (task_id,)) if not main_module.USING_POSTGRES else c.execute("DELETE FROM gm_tasks WHERE id = %s", (task_id,))
+        c.execute("DELETE FROM gm_sent_media_history WHERE task_id = ?", (task_id,)) if not main_module.USING_POSTGRES else c.execute("DELETE FROM gm_sent_media_history WHERE task_id = %s", (task_id,))
         conn.commit()
 
 # DB Helpers for Join Links
@@ -233,7 +246,7 @@ async def fetch_dialogs_async(client, ub_id):
 
 # Render task control status description
 def get_task_status_text(task):
-    t_id, name, userbot_ids_raw, group_ids_raw, message_raw, interval, last_run_timestamp, update_group, media_sources_raw, media_interval, media_mix, media_enabled = task
+    t_id, name, userbot_ids_raw, group_ids_raw, message_raw, interval, last_run_timestamp, update_group, media_sources_raw, media_interval, media_mix, media_enabled = task[:12]
     selected_ubs = json.loads(userbot_ids_raw or "[]")
     selected_groups = json.loads(group_ids_raw or "[]")
     msg_data = json.loads(message_raw or "{}")
@@ -279,10 +292,13 @@ def get_task_status_text(task):
     )
     
     if media_enabled:
+        media_dedup = task[13] if len(task) > 13 else 0
+        dedup_lbl = "🟢 Enabled" if media_dedup else "🔴 Disabled"
         status_text += (
             f"📥 *Source Chats:* `{len(selected_sources)}` configured\n"
             f"⏱ *Media Interval:* `{media_interval} seconds`\n"
             f"🔀 *Mix Mode:* {mix_lbl}\n"
+            f"🛡️ *Duplicate Protection:* `{dedup_lbl}`\n"
         )
     else:
         status_text += f"💬 *Mailer Message:* {msg_status}\n"
@@ -314,11 +330,14 @@ def get_task_control_markup(task):
             InlineKeyboardButton("📥 Source Chats", callback_data=f"gm_tasksrcgrps_{t_id}"),
             InlineKeyboardButton("⏱ Media Interval", callback_data=f"gm_taskmedint_{t_id}")
         )
-        # Row 3: Mode Toggle, Mix Toggle
+        # Row 3: Mode Toggle, Mix Toggle, Dups Toggle
         mix_btn_text = "🔀 Mix: ON" if media_mix else "🔀 Mix: OFF"
+        media_dedup = task[13] if len(task) > 13 else 0
+        dup_btn_text = "🛡️ Dups: ON" if media_dedup else "🛡️ Dups: OFF"
         markup.row(
             InlineKeyboardButton(mode_btn_text, callback_data=f"gm_tasktglmode_{t_id}"),
-            InlineKeyboardButton(mix_btn_text, callback_data=f"gm_tasktglmix_{t_id}")
+            InlineKeyboardButton(mix_btn_text, callback_data=f"gm_tasktglmix_{t_id}"),
+            InlineKeyboardButton(dup_btn_text, callback_data=f"gm_tasktgldup_{t_id}")
         )
     else:
         # Row 1: Select Userbots, Select Msg
@@ -369,10 +388,12 @@ def get_task_control_buttons_telethon(task):
     
     if media_enabled:
         mix_btn_text = "🔀 Mix: ON" if media_mix else "🔀 Mix: OFF"
+        media_dedup = task[13] if len(task) > 13 else 0
+        dup_btn_text = "🛡️ Dups: ON" if media_dedup else "🛡️ Dups: OFF"
         return [
             [Button.inline("👤 Select Userbots", f"gm_taskubs_{t_id}"), Button.inline("👥 Target Groups", f"gm_taskgrps_{t_id}")],
             [Button.inline("📥 Source Chats", f"gm_tasksrcgrps_{t_id}"), Button.inline("⏱ Media Interval", f"gm_taskmedint_{t_id}")],
-            [Button.inline(mode_btn_text, f"gm_tasktglmode_{t_id}"), Button.inline(mix_btn_text, f"gm_tasktglmix_{t_id}")],
+            [Button.inline(mode_btn_text, f"gm_tasktglmode_{t_id}"), Button.inline(mix_btn_text, f"gm_tasktglmix_{t_id}"), Button.inline(dup_btn_text, f"gm_tasktgldup_{t_id}")],
             [Button.inline("⏰ Repeat Interval", f"gm_taskrep_{t_id}"), Button.inline("🔗 Import Join Links", f"gm_tasklinks_{t_id}")],
             [op_button],
             [Button.inline("🗑 Delete Task", f"gm_taskdel_{t_id}"), Button.inline("🔙 Back to Tasks", "gm_tasks_list")]
@@ -863,6 +884,14 @@ def handle_tasks_callbacks(call):
         bot.answer_callback_query(call.id, "🛑 Stopping campaign operation...")
         handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_task_view_{t_id}", 'message': call.message, 'id': call.id})())
 
+    elif data.startswith("gm_tasktgldup_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        new_dedup = 0 if (task[13] if len(task) > 13 else 0) else 1
+        db_update_task(t_id, "media_dedup", new_dedup)
+        bot.answer_callback_query(call.id, f"🛡️ Duplicate Protection: {'ON' if new_dedup else 'OFF'}")
+        handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_task_view_{t_id}", 'message': call.message, 'id': call.id})())
+
 # Catch-all sub-handlers for page navigations and toggles on tasks
 @bot.callback_query_handler(func=lambda call: call.data.startswith("gm_t"))
 def handle_task_checklist_callbacks(call):
@@ -1215,11 +1244,15 @@ def handle_task_states(message):
 
 # Asynchronous campaign execution running failover and joining logic
 async def run_task_broadcast(task_id, is_auto=False):
+    if active_broadcasts.get(task_id):
+        logger.warning(f"Campaign {task_id} is already running. Skipping execution.")
+        return
+
     task = db_get_task(task_id)
     if not task:
         return
         
-    t_id, name, userbot_ids_raw, group_ids_raw, message_raw, interval, _, update_group_id, media_sources_raw, media_interval, media_mix, media_enabled = task
+    t_id, name, userbot_ids_raw, group_ids_raw, message_raw, interval, _, update_group_id, media_sources_raw, media_interval, media_mix, media_enabled, last_source_ids_raw, media_dedup = task
     ub_ids = json.loads(userbot_ids_raw or "[]")
     selected_groups = json.loads(group_ids_raw or "[]")
     msg_data = json.loads(message_raw or "{}")
@@ -1229,12 +1262,12 @@ async def run_task_broadcast(task_id, is_auto=False):
     label = f"⏰ Scheduled Campaign: {name}" if is_auto else f"📬 Task Mailer: {name}"
     
     dest_chat = int(update_group_id) if (update_group_id and update_group_id.strip()) else None
-
-    # Update database last run timestamp
-    db_update_task(task_id, "last_run", time.time())
     
     if not ub_ids or not selected_groups:
         return
+
+    if not media_enabled:
+        db_update_task(task_id, "last_run", time.time())
 
     active_broadcasts[task_id] = True
     try:
@@ -1270,25 +1303,54 @@ async def run_task_broadcast(task_id, is_auto=False):
                 except Exception:
                     pass
                 
-            # Fetch media messages from all sources
+            # Parse last processed message IDs cursor
+            last_processed = json.loads(last_source_ids_raw or "{}")
+            new_last_processed = dict(last_processed)
+            
+            # Fetch media messages from each source separately
             sources_media = {}
             for src_id in selected_sources:
                 if not active_broadcasts.get(task_id):
                     break
                 try:
                     group_media = []
-                    async for msg in client.iter_messages(src_id, limit=30):
+                    last_id = last_processed.get(str(src_id))
+                    max_id_seen = last_id
+                    
+                    # Fetch up to 1000 messages (large batch limit)
+                    async for msg in client.iter_messages(src_id, limit=1000):
                         if not active_broadcasts.get(task_id):
                             break
+                        if last_id and msg.id <= last_id:
+                            break
+                        if media_dedup:
+                            with main_module.db_conn() as conn:
+                                c_history = conn.cursor()
+                                query_hist = "SELECT 1 FROM gm_sent_media_history WHERE task_id = ? AND source_chat_id = ? AND message_id = ?" if not main_module.USING_POSTGRES else "SELECT 1 FROM gm_sent_media_history WHERE task_id = %s AND source_chat_id = %s AND message_id = %s"
+                                c_history.execute(query_hist, (t_id, str(src_id), msg.id))
+                                if c_history.fetchone():
+                                    continue
                         if msg.media:
                             group_media.append(msg)
+                        if max_id_seen is None or msg.id > max_id_seen:
+                            max_id_seen = msg.id
+                            
                     if group_media:
+                        # Reverse so oldest new messages are sent first
+                        group_media.reverse()
+                        
                         if media_mix:
                             random.shuffle(group_media)
                         sources_media[src_id] = group_media
+                        
+                    if max_id_seen is not None:
+                        new_last_processed[str(src_id)] = max_id_seen
                 except Exception as e:
                     logger.error(f"Error fetching media from {src_id}: {e}")
                     
+            # Save new cursors to DB
+            db_update_task(task_id, "last_source_ids", json.dumps(new_last_processed))
+            
             media_items = []
             if sources_media:
                 if media_mix:
@@ -1406,6 +1468,15 @@ async def run_task_broadcast(task_id, is_auto=False):
                             
                     if group_sent_successfully:
                         success += 1
+                        if media_dedup:
+                            try:
+                                with main_module.db_conn() as conn:
+                                    c_history = conn.cursor()
+                                    query_insert = "INSERT OR IGNORE INTO gm_sent_media_history (task_id, source_chat_id, message_id) VALUES (?, ?, ?)" if not main_module.USING_POSTGRES else "INSERT INTO gm_sent_media_history (task_id, source_chat_id, message_id) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
+                                    c_history.execute(query_insert, (t_id, str(msg.chat_id), msg.id))
+                                    conn.commit()
+                            except Exception as hist_err:
+                                logger.error(f"Error saving message {msg.id} to sent history: {hist_err}")
                     else:
                         failed += 1
                         report_lines = [f"❌ *Media {idx+1} to Target ID:* `{group_id}`"]
@@ -1616,6 +1687,8 @@ async def run_task_broadcast(task_id, is_auto=False):
                 except Exception as e:
                     logger.error(f"Error sending failure report: {e}")
     finally:
+        if media_enabled:
+            db_update_task(task_id, "last_run", time.time())
         active_broadcasts.pop(task_id, None)
 
 
@@ -2883,6 +2956,17 @@ def setup_group_mailer_handlers(client):
             t_id = int(parts[-1])
             active_broadcasts[t_id] = False
             await event.answer("🛑 Stopping campaign operation...")
+            task = db_get_task(t_id)
+            status_desc = get_task_status_text(task)
+            buttons = get_task_control_buttons_telethon(task)
+            await event.edit(f"📬 **TASK CONTROL PANEL**\n\n{status_desc}", buttons=buttons)
+
+        elif data.startswith("gm_tasktgldup_"):
+            t_id = int(parts[-1])
+            task = db_get_task(t_id)
+            new_dedup = 0 if (task[13] if len(task) > 13 else 0) else 1
+            db_update_task(t_id, "media_dedup", new_dedup)
+            await event.answer(f"🛡️ Duplicate Protection: {'ON' if new_dedup else 'OFF'}")
             task = db_get_task(t_id)
             status_desc = get_task_status_text(task)
             buttons = get_task_control_buttons_telethon(task)
