@@ -2949,7 +2949,7 @@ def send_search_posts_page(bot_instance, chat_id, username, offset=0, client_typ
     # Process and deliver
     # Preserve chronological parent order when iterating
     for pid in post_ids:
-        media_list = media_by_post[pid]
+        media_list = media_by_post[pid][:10]
         if not media_list:
             continue
             
@@ -4245,7 +4245,7 @@ async def async_send_search_posts_page_telethon(client, chat_id, username, offse
             post_metadata[pid] = (cap, likes, comments, taken)
             
     for pid in post_ids:
-        media_list = media_by_post[pid]
+        media_list = media_by_post[pid][:10]
         if not media_list:
             continue
             
