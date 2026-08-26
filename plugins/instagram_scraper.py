@@ -510,7 +510,7 @@ class HikerAPIScraper:
     def get_user_info(cls, username, api_key, host=None):
         username_clean = username.lstrip("@").strip()
         url = f"https://api.hikerapi.com/v1/user/by/username?username={username_clean}"
-        response = requests.get(url, headers=cls._headers(api_key), timeout=25)
+        response = requests.get(url, headers=cls._headers(api_key), timeout=90)
         if response.status_code != 200:
             raise RuntimeError(f"HikerAPI user info failed: Status {response.status_code}")
             
@@ -541,7 +541,7 @@ class HikerAPIScraper:
         if cursor:
             params["end_cursor"] = cursor
             
-        response = requests.get(url, params=params, headers=cls._headers(api_key), timeout=25)
+        response = requests.get(url, params=params, headers=cls._headers(api_key), timeout=90)
         if response.status_code != 200:
             raise RuntimeError(f"HikerAPI posts failed: Status {response.status_code}")
             
@@ -605,7 +605,7 @@ class HikerAPIScraper:
         # 2. Query stories by user ID using v1/user/stories
         url = f"https://api.hikerapi.com/v1/user/stories"
         params = {"user_id": user_id}
-        response = requests.get(url, params=params, headers=cls._headers(api_key), timeout=25)
+        response = requests.get(url, params=params, headers=cls._headers(api_key), timeout=90)
         
         if response.status_code == 404:
             set_instagram_setting("last_stories_debug", "HikerAPI: 404 Not Found (user has no active stories)")
@@ -745,15 +745,15 @@ class RapidAPIScraper:
         
         if "instagram-best-experience" in host:
             url = f"https://{host}/profile?username={username_clean}"
-            response = requests.get(url, headers=cls._headers(api_key, host), timeout=25)
+            response = requests.get(url, headers=cls._headers(api_key, host), timeout=90)
         elif is_get_api:
             url = f"https://{host}/v1/info?username_or_id_or_url={username_clean}"
             if "data12" in host:
                 url = f"https://{host}/user/info?username={username_clean}"
-            response = requests.get(url, headers=cls._headers(api_key, host), timeout=25)
+            response = requests.get(url, headers=cls._headers(api_key, host), timeout=90)
         else:
             url = f"https://{host}/api/instagram/profile"
-            response = requests.post(url, headers=cls._headers(api_key, host), json={"username": username_clean}, timeout=25)
+            response = requests.post(url, headers=cls._headers(api_key, host), json={"username": username_clean}, timeout=90)
             
         if response.status_code != 200:
             raise RuntimeError(f"API request failed with status {response.status_code}")
@@ -830,7 +830,7 @@ class RapidAPIScraper:
         
         if "instagram-best-experience" in host:
             prof_url = f"https://{host}/profile?username={username_clean}"
-            prof_res = requests.get(prof_url, headers=cls._headers(api_key, host), timeout=25)
+            prof_res = requests.get(prof_url, headers=cls._headers(api_key, host), timeout=90)
             if prof_res.status_code != 200:
                 raise RuntimeError(f"Failed to fetch profile ID (Status {prof_res.status_code})")
             
@@ -843,15 +843,15 @@ class RapidAPIScraper:
                 raise RuntimeError(f"User ID not found in profile response for {username_clean}")
                 
             url = f"https://{host}/stories?user_id={user_id}"
-            response = requests.get(url, headers=cls._headers(api_key, host), timeout=25)
+            response = requests.get(url, headers=cls._headers(api_key, host), timeout=90)
         elif is_get_api:
             url = f"https://{host}/v1/stories?username_or_id_or_url={username_clean}"
             if "data12" in host:
                 url = f"https://{host}/user/stories?username={username_clean}"
-            response = requests.get(url, headers=cls._headers(api_key, host), timeout=25)
+            response = requests.get(url, headers=cls._headers(api_key, host), timeout=90)
         else:
             url = f"https://{host}/api/instagram/stories"
-            response = requests.post(url, headers=cls._headers(api_key, host), json={"username": username_clean}, timeout=25)
+            response = requests.post(url, headers=cls._headers(api_key, host), json={"username": username_clean}, timeout=90)
             
         if response.status_code == 404:
             return []
@@ -946,7 +946,7 @@ class RapidAPIScraper:
         user_id = None
         if "instagram-best-experience" in host:
             prof_url = f"https://{host}/profile?username={username_clean}"
-            prof_res = requests.get(prof_url, headers=cls._headers(api_key, host), timeout=25)
+            prof_res = requests.get(prof_url, headers=cls._headers(api_key, host), timeout=90)
             if prof_res.status_code != 200:
                 raise RuntimeError(f"Failed to fetch profile ID (Status {prof_res.status_code})")
             
@@ -963,7 +963,7 @@ class RapidAPIScraper:
                 url = f"https://{host}/feed?user_id={user_id}"
                 if current_cursor:
                     url += f"&max_id={current_cursor}&cursor={current_cursor}"
-                response = requests.get(url, headers=cls._headers(api_key, host), timeout=25)
+                response = requests.get(url, headers=cls._headers(api_key, host), timeout=90)
             elif is_get_api:
                 url_args = f"username_or_id_or_url={username_clean}&count=100&limit=100"
                 if current_cursor:
@@ -973,7 +973,7 @@ class RapidAPIScraper:
                     url = f"https://{host}/user/posts?username={username_clean}&count=100&limit=100"
                     if current_cursor:
                         url += f"&cursor={current_cursor}&max_id={current_cursor}"
-                response = requests.get(url, headers=cls._headers(api_key, host), timeout=25)
+                response = requests.get(url, headers=cls._headers(api_key, host), timeout=90)
             else:
                 url = f"https://{host}/api/instagram/posts"
                 payload = {"username": username_clean, "count": 100, "limit": 100}
@@ -982,7 +982,7 @@ class RapidAPIScraper:
                     payload["max_id"] = current_cursor
                     payload["next_max_id"] = current_cursor
                     payload["pagination_token"] = current_cursor
-                response = requests.post(url, headers=cls._headers(api_key, host), json=payload, timeout=25)
+                response = requests.post(url, headers=cls._headers(api_key, host), json=payload, timeout=90)
                 
             if response.status_code != 200:
                 if attempt == 0:
