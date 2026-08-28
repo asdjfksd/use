@@ -34,6 +34,8 @@ get_setting = main_module.get_setting
 admin_states = main_module.admin_states
 userbot_fleet_manager = main_module.userbot_fleet_manager
 loop = main_module.loop
+ADMIN_ID = main_module.ADMIN_ID
+
 
 # Media folder configuration
 MEDIA_DIR = "mailer_media"
@@ -2138,7 +2140,7 @@ def setup_group_mailer_handlers(client):
             buttons=buttons
         )
 
-    @client.on(events.NewMessage)
+    @client.on(events.NewMessage(incoming=True))
     async def group_mailer_private_cmd_handler(event):
         m = event.message
         if not m or not m.text:
