@@ -4128,7 +4128,7 @@ def setup_automation_handlers(client: TelegramClient):
                 except Exception as e:
                     logger.error(f"Failed to forward reacted message to target {target}: {e}")
 
-    @client.on(events.NewMessage)
+    @client.on(events.NewMessage(incoming=True))
     async def auto_handler(event):
         m = event.message
         if not m: return
