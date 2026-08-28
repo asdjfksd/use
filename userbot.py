@@ -116,6 +116,9 @@ album_processing_lock = set() # Track groups actively running pipeline execution
 manager_album_cache = {}
 manager_album_processing_lock = set()
 media_semaphore = asyncio.Semaphore(2) # Limit concurrent download/upload operations
+pm_album_cache = {}
+pm_album_lock = set()
+
 
 # Deduplication cache for incoming message events
 processed_messages = set()
@@ -3848,6 +3851,72 @@ async def process_and_send_message_link(client: TelegramClient, link_info, sende
         logger.error(f"Error processing message link: {e}")
         return False, str(e)
 
+async def delayed_pm_forward_album(gid, chat_id, client):
+    await asyncio.sleep(2.0)  # Time window to collect all messages of the album
+    messages = pm_album_cache.pop(gid, [])
+    if not messages:
+        return
+        
+    lock_key = f"pm_fwd_{chat_id}_{gid}"
+    if lock_key in pm_album_lock:
+        return
+    pm_album_lock.add(lock_key)
+    
+    try:
+        messages.sort(key=lambda x: x.id)
+        # Separate self-destructing/view-once from normal messages
+        destructive_msgs = []
+        normal_msgs = []
+        for msg in messages:
+            ttl = getattr(msg, 'ttl_seconds', None) or (getattr(msg.media, 'ttl_seconds', None) if msg.media else None)
+            if ttl and ttl > 0:
+                destructive_msgs.append(msg)
+            else:
+                normal_msgs.append(msg)
+                
+        targets_str = get_setting("pm_media_forwarding_targets") or ""
+        target_ids = [t.strip() for t in targets_str.split(",") if t.strip()]
+        
+        # 1. Process normal messages together as an album
+        if normal_msgs:
+            for tid in target_ids:
+                try:
+                    tgt_peer = await resolve_target_id(client, int(tid))
+                    await client.forward_messages(
+                        entity=tgt_peer,
+                        messages=normal_msgs,
+                        from_peer=chat_id
+                    )
+                    logger.info(f"📬 PM_FORWARD: Auto-forwarded album ({len(normal_msgs)} items) from user {chat_id} to target {tid}")
+                except Exception as pm_err:
+                    logger.error(f"Failed to auto-forward PM album to target {tid}: {pm_err}")
+                    
+        # 2. Process self-destructing messages individually
+        if destructive_msgs:
+            allow_destructive = get_setting("pm_media_forwarding_allow_destructive") == "1"
+            if allow_destructive:
+                for msg in destructive_msgs:
+                    try:
+                        temp_path = await client.download_media(msg)
+                        if temp_path:
+                            for tid in target_ids:
+                                try:
+                                    tgt_peer = await resolve_target_id(client, int(tid))
+                                    await client.send_message(
+                                        entity=tgt_peer,
+                                        file=temp_path,
+                                        message=msg.message or ""
+                                    )
+                                    logger.info(f"🔥 PM_FORWARD: Saved and sent decrypted self-destructing media from album to target {tid}")
+                                except Exception as send_err:
+                                    logger.error(f"Failed to send decrypted self-destructing media from album to target {tid}: {send_err}")
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+                    except Exception as dl_err:
+                        logger.error(f"Failed to pre-download self-destructing media from album: {dl_err}")
+    finally:
+        pm_album_lock.discard(lock_key)
+
 def setup_automation_handlers(client: TelegramClient):
     if getattr(client, '_automation_handlers_registered', False):
         logger.info("Automation handlers already registered on this client. Skipping.")
@@ -4429,53 +4498,57 @@ def setup_automation_handlers(client: TelegramClient):
             if not is_me:
                 pm_enabled = get_setting("pm_media_forwarding_enabled") == "1"
                 if pm_enabled:
-                    # Detect self-destructing/view-once media via TTL
-                    ttl = getattr(m, 'ttl_seconds', None) or getattr(m.media, 'ttl_seconds', None)
-                    is_destructive = ttl and (ttl > 0)
-                    
-                    targets_str = get_setting("pm_media_forwarding_targets") or ""
-                    target_ids = [t.strip() for t in targets_str.split(",") if t.strip()]
-                    
-                    if is_destructive:
-                        # Only proceed if allowed in settings
-                        allow_destructive = get_setting("pm_media_forwarding_allow_destructive") == "1"
-                        if allow_destructive:
-                            try:
-                                # Standard forward is blocked by server, so we decrypt and download locally first
-                                temp_path = await client.download_media(m)
-                                if temp_path:
-                                    for tid in target_ids:
-                                        try:
-                                            tgt_peer = await resolve_target_id(client, int(tid))
-                                            await client.send_message(
-                                                entity=tgt_peer,
-                                                file=temp_path,
-                                                message=m.message or ""
-                                            )
-                                            logger.info(f"🔥 PM_FORWARD: Saved and sent decrypted self-destructing media to target {tid}")
-                                        except Exception as send_err:
-                                            logger.error(f"Failed to send decrypted self-destructing media to target {tid}: {send_err}")
-                                    
-                                    # Strict local cleanup
-                                    if os.path.exists(temp_path):
-                                        os.remove(temp_path)
-                            except Exception as dl_err:
-                                logger.error(f"Failed to pre-download self-destructing media: {dl_err}")
+                    if m.grouped_id is not None:
+                        # Grouped album: cache and forward together
+                        if m.grouped_id not in pm_album_cache:
+                            pm_album_cache[m.grouped_id] = [m]
+                            asyncio.create_task(delayed_pm_forward_album(m.grouped_id, event.chat_id, client))
                         else:
-                            logger.info(f"📬 PM_FORWARD: Skipped self-destructing media because allow_destructive toggle is disabled.")
+                            if m.id not in [msg.id for msg in pm_album_cache[m.grouped_id]]:
+                                pm_album_cache[m.grouped_id].append(m)
                     else:
-                        # Normal media: standard forward directly
-                        for tid in target_ids:
-                            try:
-                                tgt_peer = await resolve_target_id(client, int(tid))
-                                await client.forward_messages(
-                                    entity=tgt_peer,
-                                    messages=m,
-                                    from_peer=event.chat_id
-                                )
-                                logger.info(f"📬 PM_FORWARD: Auto-forwarded media message {m.id} from user {m.sender_id} to target {tid}")
-                            except Exception as pm_err:
-                                logger.error(f"Failed to auto-forward normal PM media to target {tid}: {pm_err}")
+                        # Single media: process immediately
+                        ttl = getattr(m, 'ttl_seconds', None) or getattr(m.media, 'ttl_seconds', None)
+                        is_destructive = ttl and (ttl > 0)
+                        
+                        targets_str = get_setting("pm_media_forwarding_targets") or ""
+                        target_ids = [t.strip() for t in targets_str.split(",") if t.strip()]
+                        
+                        if is_destructive:
+                            allow_destructive = get_setting("pm_media_forwarding_allow_destructive") == "1"
+                            if allow_destructive:
+                                try:
+                                    temp_path = await client.download_media(m)
+                                    if temp_path:
+                                        for tid in target_ids:
+                                            try:
+                                                tgt_peer = await resolve_target_id(client, int(tid))
+                                                await client.send_message(
+                                                    entity=tgt_peer,
+                                                    file=temp_path,
+                                                    message=m.message or ""
+                                                )
+                                                logger.info(f"🔥 PM_FORWARD: Saved and sent decrypted self-destructing media to target {tid}")
+                                            except Exception as send_err:
+                                                logger.error(f"Failed to send decrypted self-destructing media to target {tid}: {send_err}")
+                                        if os.path.exists(temp_path):
+                                            os.remove(temp_path)
+                                except Exception as dl_err:
+                                    logger.error(f"Failed to pre-download self-destructing media: {dl_err}")
+                            else:
+                                logger.info(f"📬 PM_FORWARD: Skipped self-destructing media because allow_destructive toggle is disabled.")
+                        else:
+                            for tid in target_ids:
+                                try:
+                                    tgt_peer = await resolve_target_id(client, int(tid))
+                                    await client.forward_messages(
+                                        entity=tgt_peer,
+                                        messages=m,
+                                        from_peer=event.chat_id
+                                    )
+                                    logger.info(f"📬 PM_FORWARD: Auto-forwarded media message {m.id} from user {m.sender_id} to target {tid}")
+                                except Exception as pm_err:
+                                    logger.error(f"Failed to auto-forward normal PM media to target {tid}: {pm_err}")
 
         # Promotion keyword check for unauthorized users (Private chats with userbot)
         is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
