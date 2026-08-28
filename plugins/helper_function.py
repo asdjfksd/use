@@ -274,17 +274,10 @@ async def run_rejoin_check():
     return results
 
 async def autorejoin_check_loop():
-    logger.info("Auto-Rejoin: Periodic validation check task started.")
     await asyncio.sleep(30) # Delay initial check on startup
     while True:
         try:
-            logger.info("Auto-Rejoin: Running periodic validation checks for all monitored links...")
-            results = await run_rejoin_check()
-            if results:
-                for link, statuses in results.items():
-                    logger.info(f"Auto-Rejoin: Link: {link} -> {', '.join(statuses)}")
-            else:
-                logger.info("Auto-Rejoin: No monitored links found or no active userbots.")
+            await run_rejoin_check()
         except Exception as e:
             logger.error(f"Error in autorejoin loop: {e}")
         await asyncio.sleep(300) # Check every 5 minutes
@@ -294,7 +287,7 @@ def setup_alljoin_plugin_handlers(client):
         return
     client._alljoin_handlers_registered = True
 
-    @client.on(events.NewMessage)
+    @client.on(events.NewMessage(incoming=True))
     async def alljoin_plugin_handler(event):
         m = event.message
         if not m or not m.text:
@@ -311,18 +304,13 @@ def setup_alljoin_plugin_handlers(client):
 
         me = getattr(client, '_me', None)
 
-        fleet_user_ids = {c._me.id for c in userbot_fleet_manager.get_all_clients() if getattr(c, '_me', None)}
-        if me:
-            fleet_user_ids.add(me.id)
-
         # Enforce strict authorization checks for command usage
         text = m.text.strip()
         if text.startswith('.'):
             is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
             is_manager = is_primary_admin or is_authorized_manager(m.sender_id)
-            is_userbot = m.sender_id in fleet_user_ids
             
-            if not (is_manager or is_userbot):
+            if not is_manager:
                 return
 
             parts = text.split()
@@ -358,6 +346,7 @@ def setup_alljoin_plugin_handlers(client):
 
                     try:
                         chat_entity = None
+                        already_joined = False
                         if parsed and parsed["type"] == "invite":
                             from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
                             
@@ -373,12 +362,28 @@ def setup_alljoin_plugin_handlers(client):
                                 if hasattr(result, "chats") and result.chats:
                                     chat_entity = result.chats[0]
                             except errors.UserAlreadyParticipantError:
-                                if not chat_entity and invite_info:
-                                    chat_entity = getattr(invite_info, 'chat', None)
+                                already_joined = True
+                                if not chat_entity:
+                                    if invite_info:
+                                        chat_entity = getattr(invite_info, 'chat', None)
+                                    else:
+                                        try:
+                                            invite_info = await u_client(CheckChatInviteRequest(parsed["hash"]))
+                                            chat_entity = getattr(invite_info, 'chat', None)
+                                        except Exception:
+                                            pass
                             except Exception as e:
                                 if "USER_ALREADY_PARTICIPANT" in str(e):
-                                    if not chat_entity and invite_info:
-                                        chat_entity = getattr(invite_info, 'chat', None)
+                                    already_joined = True
+                                    if not chat_entity:
+                                        if invite_info:
+                                            chat_entity = getattr(invite_info, 'chat', None)
+                                        else:
+                                            try:
+                                                invite_info = await u_client(CheckChatInviteRequest(parsed["hash"]))
+                                                chat_entity = getattr(invite_info, 'chat', None)
+                                            except Exception:
+                                                pass
                                 else:
                                     raise e
                                     
@@ -403,6 +408,13 @@ def setup_alljoin_plugin_handlers(client):
                                 "title": title,
                                 "cid": cid
                             })
+                        elif already_joined:
+                            results.append({
+                                "name": u_name,
+                                "status": "Success",
+                                "title": "Already Participant",
+                                "cid": "Already Joined"
+                            })
                         else:
                             results.append({
                                 "name": u_name,
@@ -411,26 +423,32 @@ def setup_alljoin_plugin_handlers(client):
                                 "cid": None
                             })
                     except Exception as e:
-                        results.append({
-                            "name": u_name,
-                            "status": f"Failed: {str(e)}",
-                            "title": None,
-                            "cid": None
-                        })
+                        err_str = str(e)
+                        if "USER_ALREADY_PARTICIPANT" in err_str:
+                            from telethon.utils import get_peer_id
+                            cid = get_peer_id(chat_entity) if 'chat_entity' in locals() and chat_entity else "Already Joined"
+                            title = getattr(chat_entity, 'title', None) or getattr(chat_entity, 'first_name', None) or "Already Participant" if 'chat_entity' in locals() and chat_entity else "Already Participant"
+                            results.append({
+                                "name": u_name,
+                                "status": "Success",
+                                "title": title,
+                                "cid": cid
+                            })
+                        else:
+                            results.append({
+                                "name": u_name,
+                                "status": f"Failed: {str(e)}",
+                                "title": None,
+                                "cid": None
+                            })
 
                 # Format report
                 report_lines = ["📢 **AllJoin Request Results:**"]
                 for res in results:
-                    report_lines.append(f"\n👤 **Userbot:** `{res['name']}`")
                     if res['status'] == "Success":
-                        report_lines.append(f"✅ **Joined Successfully!**")
-                        report_lines.append(f"• **Group Name:** `{res['title']}`")
-                        report_lines.append(f"• **Group ID:** `{res['cid']}`")
-                        report_lines.append(f"💡 **Quick Setup Templates:**")
-                        report_lines.append(f"  • Set as Source: `.pair {res['cid']} <target_id>`")
-                        report_lines.append(f"  • Set as Target: `.pair <source_id> {res['cid']}`")
+                        report_lines.append(f"👤 **{res['name']}**: ✅ Joined `{res['title']}` (`{res['cid']}`)")
                     else:
-                        report_lines.append(f"❌ **Status:** {res['status']}")
+                        report_lines.append(f"👤 **{res['name']}**: ❌ Failed: `{res['status']}`")
 
                 await event.reply("\n".join(report_lines))
                 return
@@ -629,7 +647,7 @@ def setup_alljoin_plugin_handlers(client):
                         return
                     rep_lines = ["🔄 **Auto-Rejoin Validation Results:**"]
                     for link, u_statuses in report.items():
-                        rep_lines.append(f"\n📂 **Link:** `{link}`")
+                        rep_lines.append(f"📂 **Link:** `{link}`")
                         for status in u_statuses:
                             rep_lines.append(f"  {status}")
                     await event.reply("\n".join(rep_lines))
@@ -755,7 +773,7 @@ def bot_autorejoin(message):
                 return
             rep_lines = ["🔄 **Auto-Rejoin Validation Results:**"]
             for link, u_statuses in report.items():
-                rep_lines.append(f"\n📂 **Link:** `{link}`")
+                rep_lines.append(f"📂 **Link:** `{link}`")
                 for status in u_statuses:
                     rep_lines.append(f"  {status}")
             bot.send_message(message.chat.id, "\n".join(rep_lines), parse_mode="Markdown")
